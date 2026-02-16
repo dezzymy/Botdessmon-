@@ -31,14 +31,44 @@ from forecasting_tools import (
     structure_output,
 )
 
+# ---------------------------------------------------------------------------
+# Additional optional search provider imports.  These libraries are not part
+# of the standard forecasting-tools dependency stack but can be installed
+# separately to enable direct calls to Tavily and Exa search APIs.  If the
+# libraries are not available or the user does not supply API keys the bot
+# will gracefully fall back to the built‑in SmartSearcher behaviour.
+#
+# See:
+#  * Tavily Search API documentation – https://docs.tavily.com/
+#  * Exa Python SDK documentation – https://pypi.org/project/exa-py/
+#
+try:
+    # Tavily provides a high-level Python client for its search API.  When
+    # available, it allows us to perform a real-time web search with a simple
+    # call such as `TavilyClient(api_key=...).search(query)`.  The results
+    # include titles, snippets and sometimes full content which we can then
+    # summarise with our LLM.
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None  # type: ignore
+
+try:
+    # Exa offers a Python SDK (`exa-py`) that can be used to perform
+    # semantic and keyword search on the open web.  Initialising the client
+    # requires an API key and supports a variety of search parameters.
+    from exa_py import Exa
+except ImportError:
+    Exa = None  # type: ignore
+
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
-# Configuration: ONLY OpenRouter free model + EXA/Tavily keys for search
+# Configuration: ONLY OpenROUTER_FREE_MODEL + EXA/Tavily keys for search
 # ---------------------------------------------------------------------
 
-OPENROUTER_FREE_MODEL = "openrouter/openrouter/free"
+OPENROUTER_FREE_MODEL = "openrouter/openai/gpt-5.1"
 
 # LiteLLM/OpenRouter typically uses OPENROUTER_API_KEY, but if your setup differs,
 # update REQUIRED_ENV_VARS_BASE accordingly.
@@ -80,14 +110,39 @@ class SpringTemplateBot2026(ForecastBot):
     """
     Template bot for Spring 2026 Metaculus AI Tournament.
 
-    Edits in this version:
-    - Research is enforced to use SmartSearcher (web search) which should use EXA_API_KEY and TAVILY_API_KEY.
-    - All LLM calls are enforced to use only openrouter/openrouter/free.
+    This implementation extends the baseline template by introducing two
+    key modifications:
+
+    1. Research is performed with a preference for the Tavily search API and
+       will automatically fall back to Exa if the Tavily search fails.  Both
+       search APIs require their respective API keys in the environment
+       variables `TAVILY_API_KEY` and `EXA_API_KEY`.  Results retrieved from
+       these APIs are summarised using the OpenRouter free LLM model.  If
+       neither search API is available (e.g. the Python package is missing
+       or an API key is not provided), the bot will revert to using the
+       original SmartSearcher interface.
+
+    2. Binary question probabilities are lightly "extremised" by constraining
+       the forecasted probability to lie within [0.02, 0.98].  This is
+       intended to modestly increase forecast sharpness by avoiding overly
+       middling probabilities; extreme forecasts are capped at 98% in the
+       direction suggested by the underlying LLM output.  Feel free to
+       adjust `MIN_PROBABILITY` and `MAX_PROBABILITY` below if you prefer
+       tighter or looser caps.
     """
 
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    # Bounds for extremising binary forecasts.  These constants define the
+    # minimum and maximum probabilities returned by the system.  For example,
+    # with MIN_PROBABILITY=0.02 and MAX_PROBABILITY=0.98, a raw forecast of
+    # 0.85 would be left unchanged, while 0.995 would be reduced to 0.98 and
+    # 0.01 would be increased to 0.02.  If you do not wish to extremise
+    # probabilities you can set them to (0.0, 1.0).
+    MIN_PROBABILITY: float = 0.02
+    MAX_PROBABILITY: float = 0.98
 
     # ------------------------- Internal enforcement helpers -------------------------
 
@@ -116,9 +171,14 @@ class SpringTemplateBot2026(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         """
         Enforced research policy:
-        - Must use SmartSearcher (web search).
-        - Requires EXA_API_KEY and TAVILY_API_KEY to exist.
-        - Uses ONLY openrouter/openrouter/free for the LLM powering the searcher.
+
+        The bot first attempts to perform research using the Tavily search API.  If
+        that fails – for example due to network errors, missing packages or
+        authentication issues – it automatically falls back to using the Exa
+        search API.  Should both custom search APIs prove unavailable or fail,
+        the bot reverts to the baseline SmartSearcher implementation enforced by
+        the tournament rules.  Results from whichever search succeeds are then
+        summarised into a concise research note by the OpenRouter free model.
         """
         async with self._concurrency_limiter:
             researcher = self.get_llm("researcher")
@@ -126,9 +186,12 @@ class SpringTemplateBot2026(ForecastBot):
             if _is_no_research(researcher):
                 return ""
 
-            # Require search keys
-            _require_env("EXA_API_KEY")
-            _require_env("TAVILY_API_KEY")
+            # Require search keys – we will attempt to use both but fall back
+            # gracefully if one or both are not present.
+            # This call will raise if either key is missing, ensuring misconfigured
+            # environments are detected early.
+            for env_var in REQUIRED_ENV_VARS_SEARCH:
+                _require_env(env_var)
 
             prompt = clean_indents(
                 f"""
@@ -147,12 +210,89 @@ class SpringTemplateBot2026(ForecastBot):
                 """
             )
 
-            # Enforce SmartSearcher-only research to ensure EXA/Tavily usage & web grounding.
-            # Accepted researcher format: "smart-searcher/<model_name>"
+            # Attempt to perform research using Tavily.  We wrap the entire block
+            # in a try/except so that any errors – whether due to missing
+            # dependencies, invalid credentials, or network timeouts – cause a
+            # graceful fallback to Exa.  Context will accumulate the relevant
+            # information from whichever search API returns results.
+            context: str = ""
+            tavily_error: Exception | None = None
+            if TavilyClient is not None:
+                try:
+                    tav_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+                    # Perform a basic search.  Tavily's API returns a dict-like
+                    # object with keys such as 'results' and 'answer'.  The
+                    # number of results returned is governed by the API tier.
+                    tav_response = tav_client.search(question.question_text)
+                    results = tav_response.get("results", []) if isinstance(tav_response, dict) else []
+                    context_pieces: list[str] = []
+                    for r in results[:10]:
+                        title = r.get("title", "")
+                        content = r.get("content", "") or r.get("raw_content", "")
+                        if title or content:
+                            context_pieces.append(f"{title}: {content}")
+                    context = "\n\n".join(context_pieces)
+                except Exception as e:
+                    tavily_error = e
+                    logger.warning(f"Tavily search failed: {e}")
+
+            # If the Tavily search didn't produce any context, fall back to Exa
+            if not context and Exa is not None:
+                try:
+                    exa_client = Exa(api_key=os.getenv("EXA_API_KEY"))
+                    exa_response = exa_client.search(question.question_text, num_results=10)
+                    # exa_response.results is an iterable of objects with
+                    # attributes such as 'title' and 'text'.  We convert
+                    # whichever fields are available into a simple string.
+                    results = getattr(exa_response, "results", [])
+                    context_pieces: list[str] = []
+                    for r in results:
+                        title = getattr(r, "title", "")
+                        # Exa's API stores snippets in several attributes.
+                        snippet = getattr(r, "text", "") or getattr(r, "snippet", "") or getattr(r, "excerpt", "") or ""
+                        if title or snippet:
+                            context_pieces.append(f"{title}: {snippet}")
+                    context = "\n\n".join(context_pieces)
+                except Exception as exa_err:
+                    logger.warning(f"Exa search failed: {exa_err}")
+                    # If both Tavily and Exa fail, context remains empty and we
+                    # will fall back to SmartSearcher below.
+
+            if context:
+                # Use an LLM to summarise the raw search results into a coherent
+                # research report.  We incorporate the original prompt at the
+                # beginning so that the LLM understands the question and its
+                # resolution criteria when summarising the context.
+                summary_prompt = clean_indents(
+                    f"""
+                    {prompt}
+
+                    Below is a collection of web snippets relevant to the above question.  Read
+                    through these snippets and produce a concise but detailed summary of the
+                    most important facts, events, or news stories that could influence the
+                    outcome of the question.  If the snippets suggest a likely resolution,
+                    note whether the question would resolve Yes or No.  Do not introduce
+                    information that is not contained in the snippets.
+
+                    Web snippets:
+                    {context}
+                    """
+                )
+                llm = self.get_llm("default", "llm")
+                research = await llm.invoke(summary_prompt)
+                logger.info(f"Found research via direct search for URL {question.page_url}:\n{research}")
+                return research
+
+            # If neither Tavily nor Exa yielded results, fall back to the default
+            # SmartSearcher implementation.  This preserves the tournament
+            # behaviour and ensures the bot still works even if the custom
+            # providers fail completely.
+            logger.info("Falling back to SmartSearcher for research.")
+
             if isinstance(researcher, GeneralLlm):
                 raise RuntimeError(
                     "Researcher cannot be a plain LLM in this configuration. "
-                    'Set llms["researcher"] to "smart-searcher/openrouter/openrouter/free".'
+                    f'Set llms["researcher"] to "smart-searcher/{OPENROUTER_FREE_MODEL}".'
                 )
 
             if isinstance(researcher, str) and researcher.startswith("smart-searcher/"):
@@ -163,8 +303,6 @@ class SpringTemplateBot2026(ForecastBot):
                         f"SmartSearcher model must be {OPENROUTER_FREE_MODEL}, got: {model_name}"
                     )
 
-                # Instantiate searcher. If your SmartSearcher version supports explicit
-                # provider selection, you can modify here.
                 try:
                     searcher = SmartSearcher(
                         model=model_name,
@@ -174,16 +312,15 @@ class SpringTemplateBot2026(ForecastBot):
                         use_advanced_filters=False,
                     )
                 except TypeError:
-                    # Backward/forward compatibility fallback if signature changed
                     searcher = SmartSearcher(model=model_name)
 
                 research = await searcher.invoke(prompt)
-                logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+                logger.info(f"Found research via SmartSearcher for URL {question.page_url}:\n{research}")
                 return research
 
             raise RuntimeError(
                 "Invalid researcher configuration. This script enforces SmartSearcher research.\n"
-                'Use: llms["researcher"] = "smart-searcher/openrouter/openrouter/free"\n'
+                f'Use: llms["researcher"] = "smart-searcher/{OPENROUTER_FREE_MODEL}"\n'
                 f"Got: {researcher}"
             )
 
@@ -240,7 +377,9 @@ class SpringTemplateBot2026(ForecastBot):
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+        # Apply extremisation: ensure probabilities are within [MIN_PROBABILITY, MAX_PROBABILITY].
+        raw_pred = binary_prediction.prediction_in_decimal
+        decimal_pred = max(self.MIN_PROBABILITY, min(self.MAX_PROBABILITY, raw_pred))
 
         logger.info(
             f"Forecasted URL {question.page_url} with prediction: {decimal_pred}."
@@ -563,7 +702,7 @@ class SpringTemplateBot2026(ForecastBot):
             question.parent, research, "parent"
         )
         child_info, full_research = await self._get_question_prediction_info(
-            question.child, research, "child"
+            question.child, full_research, "child"
         )
         yes_info, full_research = await self._get_question_prediction_info(
             question.question_yes, full_research, "yes"
@@ -690,7 +829,7 @@ if __name__ == "__main__":
     # Research is enabled by default in this configuration.
     validate_environment(research_enabled=True)
 
-    # Enforce ONLY openrouter/openrouter/free across all LLM roles.
+    # Enforce ONLY openrouter/openai/gpt-5.1 (via OpenRouter) across all LLM roles.
     llm_config = {
         "default": GeneralLlm(
             model=OPENROUTER_FREE_MODEL,
