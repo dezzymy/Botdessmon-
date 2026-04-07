@@ -994,8 +994,8 @@ if __name__ == "__main__":
             return await bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
 
         bot.skip_previously_forecasted_questions = False
-        bot.set_active_tournament("market-pulse-26q1")
-        return await bot.forecast_on_tournament("market-pulse-26q1", return_exceptions=True)
+        bot.set_active_tournament("market-pulse-26q2")
+        return await bot.forecast_on_tournament("market-pulse-26q2", return_exceptions=True)
 
     reports = asyncio.run(run_all())
     bot.log_report_summary(reports)
