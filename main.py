@@ -75,7 +75,39 @@ def sanitize_llm_json(text: str) -> str:
         text = text[7:]
     if text.endswith("```"):
         text = text[:-3]
-    return text.strip()
+
+    def extract_json_payload(s: str) -> str:
+        s = s.strip()
+        if not s:
+            return s
+        if s[0] in "[{":
+            depth = 0
+            open_char = s[0]
+            close_char = "}" if open_char == "{" else "]"
+            for idx, ch in enumerate(s):
+                if ch == open_char:
+                    depth += 1
+                elif ch == close_char:
+                    depth -= 1
+                    if depth == 0:
+                        return s[: idx + 1]
+        start = min((s.find("{") if "{" in s else len(s)), (s.find("[") if "[" in s else len(s)))
+        if start >= len(s):
+            return s
+        open_char = s[start]
+        close_char = "}" if open_char == "{" else "]"
+        depth = 0
+        for idx in range(start, len(s)):
+            ch = s[idx]
+            if ch == open_char:
+                depth += 1
+            elif ch == close_char:
+                depth -= 1
+                if depth == 0:
+                    return s[start : idx + 1]
+        return s
+
+    return extract_json_payload(text).strip()
 
 
 def safe_model(model_cls: type[BaseModel], data: Any) -> BaseModel:
@@ -737,7 +769,7 @@ class Dezzy(ForecastBot):
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace) -> Any:
         self._ensure_some_research_or_raise(research)
-        model = "openrouter/openai/gpt-5.1"
+        model = "openrouter/openai/gpt-4o"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
 
         if isinstance(question, BinaryQuestion):
@@ -791,11 +823,28 @@ class Dezzy(ForecastBot):
     async def _multi_run(self, question: MetaculusQuestion, research: str, trace: ReasoningTrace) -> List[Any]:
         outs: List[Any] = []
         for i in range(self.runs_per_question):
-            try: outs.append(await self._single_model_forecast(question, research, i + 1, trace))
+            try:
+                outs.append(await self._single_model_forecast(question, research, i + 1, trace))
             except Exception as e:
                 logger.warning(f"run {i+1}/{self.runs_per_question} failed: {e}")
                 trace.add(f"Run {i+1}", f"FAILED: {e}")
         return outs
+
+    def _fallback_binary_prediction(self, question: BinaryQuestion, trace: ReasoningTrace) -> ReasonedPrediction[float]:
+        trace.add("Fallback prediction", "All independent binary runs failed; returning neutral probability 0.50.")
+        final_p = 0.5
+        trace.add("★ FINAL PREDICTION", f"{final_p:.4f}  ({final_p:.1%})")
+        self._recent_binary_predictions.append((question.question_text[:120], final_p))
+        if len(self._recent_binary_predictions) > 20:
+            self._recent_binary_predictions.pop(0)
+        return ReasonedPrediction(prediction_value=final_p, reasoning=trace.render())
+
+    def _fallback_mc_prediction(self, question: MultipleChoiceQuestion, trace: ReasoningTrace) -> ReasonedPrediction[PredictedOptionList]:
+        uniform = 1.0 / max(1, len(question.options))
+        final = [{"option_name": o, "probability": uniform} for o in question.options]
+        trace.add("Fallback prediction", "All independent MC runs failed; returning uniform distribution.")
+        trace.add("★ FINAL PREDICTION", " | ".join(f"{x['option_name']}={x['probability']:.1%}" for x in final))
+        return ReasonedPrediction(prediction_value=safe_model(PredictedOptionList, {"predicted_options": final}), reasoning=trace.render())
 
     # ──────────────────────────────────────────────────────────────────────────
     # Forecasting: Aggregations & Logic
@@ -811,7 +860,8 @@ class Dezzy(ForecastBot):
         trace.add("Research sources", f"{self._search_footprint(research)} | quality_weight={quality:.2f}")
 
         runs = await self._multi_run(question, research, trace)
-        if not runs: raise RuntimeError("All binary runs failed.")
+        if not runs:
+            return self._fallback_binary_prediction(question, trace)
 
         probs = [float(r.prediction_in_decimal) for r in runs]
         run_med = self._median(probs)
@@ -879,7 +929,8 @@ class Dezzy(ForecastBot):
         quality = self._research_quality_weight(research)
 
         runs = await self._multi_run(question, research, trace)
-        if not runs: raise RuntimeError("All MC runs failed.")
+        if not runs:
+            return self._fallback_mc_prediction(question, trace)
 
         opt_names = list(question.options)
         per_opt: Dict[str, List[float]] = {o: [] for o in opt_names}
