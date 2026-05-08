@@ -354,15 +354,15 @@ class Dezzy(ForecastBot):
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
 
     def _llm_config_defaults(self) -> Dict[str, str]:
-        free = "openrouter/openrouter/free"
+        free = "openrouter/anthropic/claude-sonnet-4.6"
         return {
             "default": free,
             "parser": "openrouter/gpt-4o",
-            "query_optimizer": "openrouter/claude-3-opus",
-            "critic": "openrouter/gpt-4o",
-            "red_team": "openrouter/claude-3-opus",
-            "decomposer": "openrouter/gpt-4o",
-            "summarizer": "openrouter/claude-3-opus",
+            "query_optimizer": "openrouter/anthropic/claude-opus-4.6-fast",
+            "critic": "openrouter/openai/gpt-5.4-mini",
+            "red_team": "openrouter/openai/gpt-5.4-mini",
+            "decomposer": "openrouter/anthropic/claude-sonnet-4.6",
+            "summarizer": "openrouter/openai/gpt-5.2",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -545,7 +545,7 @@ class Dezzy(ForecastBot):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _check_spring_ai_confidence(self, trace: ReasoningTrace, spread: float, quality: float):
-        is_spring_ai = self._active_tournament in ["32916", str(MetaculusClient().CURRENT_AI_COMPETITION_ID)]
+        is_spring_ai = self._active_tournament in ["33022", str(MetaculusClient().CURRENT_AI_COMPETITION_ID)]
         if not is_spring_ai: return
 
         trace.add("Spring AI Confidence Gate", f"Evaluating... spread={spread:.4f}, quality={quality:.2f}")
