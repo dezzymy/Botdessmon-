@@ -24,6 +24,8 @@ try:
 except ImportError:
     YFINANCE_AVAILABLE = False
 
+from asknews_sdk import AskNewsSDK
+
 from forecasting_tools import (
     BinaryQuestion,
     ForecastBot,
@@ -309,6 +311,7 @@ class Dezzy(ForecastBot):
             if os.getenv("TAVILY_API_KEY") else None
         )
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
+        self.asknews = AskNewsSDK(api_key=os.getenv("ASKNEWS_SECRET")) if os.getenv("ASKNEWS_SECRET") else None
 
         self._research_cache: Dict[str, str] = {}
         self._recent_binary_predictions: List[Tuple[str, float]] = []
@@ -322,12 +325,12 @@ class Dezzy(ForecastBot):
         free = "openrouter/openrouter/free"
         return {
             "default": free,
-            "parser": free,
-            "query_optimizer": free,
-            "critic": free,
-            "red_team": free,
-            "decomposer": free,
-            "summarizer": free,
+            "parser": "openrouter/gpt-4o",
+            "query_optimizer": "openrouter/claude-3-opus",
+            "critic": "openrouter/gpt-4o",
+            "red_team": "openrouter/claude-3-opus",
+            "decomposer": "openrouter/gpt-4o",
+            "summarizer": "openrouter/claude-3-opus",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -342,6 +345,12 @@ class Dezzy(ForecastBot):
             used.append("tavily")
         if ok("[Exa Search Results]", ["[Exa not configured]", "[Exa search failed]"]):
             used.append("exa")
+        if ok("[AskNews Results]", ["[AskNews not configured]", "[AskNews search failed]"]):
+            used.append("asknews")
+        if ok("[MiMo Research]", ["[MiMo research failed]"]):
+            used.append("mimo")
+        if ok("[Sonar Research]", ["[Sonar research failed]"]):
+            used.append("sonar")
         return ",".join(used) if used else "none"
 
     def _ensure_some_research_or_raise(self, research: str) -> None:
@@ -397,6 +406,56 @@ class Dezzy(ForecastBot):
         if not self.exa_searcher: return "[Exa not configured]"
         return await self.exa_searcher.search(query, num_results=6)
 
+    async def _run_asknews_search(self, query: str) -> str:
+        if not self.asknews: return "[AskNews not configured]"
+        try:
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(None, lambda: self.asknews.news.search_news(query=query, n_articles=6, hours_back=24*7, strategy="latest news"))
+            results = []
+            for article in response.articles:
+                title = article.title
+                url = article.url
+                snippet = (article.summary or "")[:900]
+                results.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
+            return f"[AskNews Results]\n" + "\n\n".join(results) if results else "[AskNews search failed]"
+        except Exception as e:
+            logger.error(f"AskNews search failed: {e}")
+            return "[AskNews search failed]"
+
+    async def _run_mimo_research(self, question: MetaculusQuestion, research: str) -> str:
+        try:
+            llm = GeneralLlm(model="openrouter/xiaomi/mimo-v2-pro", temperature=0.1)
+            prompt = clean_indents(f"""
+                You are a research assistant. Research this forecasting question using your knowledge and provide:
+                1. Key factual findings.
+                2. Signals supporting YES/higher outcome.
+                3. Signals supporting NO/lower outcome.
+                Question: {question.question_text}
+                Existing research: {research[:2000] if research else 'None'}
+            """)
+            response = await llm.invoke(prompt)
+            return f"[MiMo Research]\n{response.strip()}"
+        except Exception as e:
+            logger.error(f"MiMo research failed: {e}")
+            return "[MiMo research failed]"
+
+    async def _run_sonar_research(self, question: MetaculusQuestion, research: str) -> str:
+        try:
+            llm = GeneralLlm(model="openrouter/perplexity/sonar-reasoning-pro", temperature=0.1)
+            prompt = clean_indents(f"""
+                You are a research assistant. Research this forecasting question using your knowledge and provide:
+                1. Key factual findings.
+                2. Signals supporting YES/higher outcome.
+                3. Signals supporting NO/lower outcome.
+                Question: {question.question_text}
+                Existing research: {research[:2000] if research else 'None'}
+            """)
+            response = await llm.invoke(prompt)
+            return f"[Sonar Research]\n{response.strip()}"
+        except Exception as e:
+            logger.error(f"Sonar research failed: {e}")
+            return "[Sonar research failed]"
+
     async def _summarize_research(self, question: MetaculusQuestion, raw_research: str) -> str:
         llm = self.get_llm("summarizer", "llm")
         prompt = clean_indents(f"""
@@ -429,7 +488,14 @@ class Dezzy(ForecastBot):
         queries = await self._optimize_search_query(question, decomp)
         optimized_query = " OR ".join(queries)
 
-        results = await asyncio.gather(self._run_tavily_search(optimized_query), self._run_exa_search(optimized_query), return_exceptions=True)
+        results = await asyncio.gather(
+            self._run_tavily_search(optimized_query),
+            self._run_exa_search(optimized_query),
+            self._run_asknews_search(optimized_query),
+            self._run_mimo_research(question, ""),
+            self._run_sonar_research(question, ""),
+            return_exceptions=True
+        )
         cleaned = [f"[Search failed: {str(res)}]" if isinstance(res, Exception) else res for res in results]
         
         research = (
@@ -671,7 +737,8 @@ class Dezzy(ForecastBot):
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace) -> Any:
         self._ensure_some_research_or_raise(research)
-        llm = GeneralLlm(model=self._llm_config_defaults()["default"], temperature=self._get_temperature(question))
+        model = "openrouter/openai/gpt-5.1"
+        llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
 
         if isinstance(question, BinaryQuestion):
             raw = await llm.invoke(clean_indents(f"""
@@ -979,8 +1046,8 @@ if __name__ == "__main__":
 
     async def run_all():
         if args.mode == "tournament":
-            bot.set_active_tournament(str(client.CURRENT_AI_COMPETITION_ID))
-            seasonal_task = bot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True)
+            bot.set_active_tournament("33022")
+            seasonal_task = bot.forecast_on_tournament(33022, return_exceptions=True)
             
             bot.set_active_tournament(str(client.CURRENT_MINIBENCH_ID))
             minibench_task = bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
