@@ -546,7 +546,7 @@ class Dezzy(ForecastBot):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _check_spring_ai_confidence(self, trace: ReasoningTrace, spread: float, quality: float):
-        is_spring_ai = self._active_tournament in ["32916", str(MetaculusClient().CURRENT_AI_COMPETITION_ID)]
+        is_spring_ai = self._active_tournament in ["33022", str(MetaculusClient().CURRENT_AI_COMPETITION_ID)]
         if not is_spring_ai: return
 
         trace.add("Spring AI Confidence Gate", f"Evaluating... spread={spread:.4f}, quality={quality:.2f}")
