@@ -356,6 +356,7 @@ class Dezzy(ForecastBot):
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
 
     def _llm_config_defaults(self) -> Dict[str, str]:
+        free = "openrouter/anthropic/claude-sonnet-4.6"
         return {
             "default":         "openrouter/openai/gpt-5.1",
             "parser":          "openrouter/openai/gpt-4.1-mini",
@@ -364,6 +365,13 @@ class Dezzy(ForecastBot):
             "red_team":        "openrouter/openai/gpt-5.1",
             "decomposer":      "openrouter/anthropic/claude-sonnet-4.6",
             "summarizer":      "openrouter/anthropic/claude-opus-4.6",
+            "default": free,
+            "parser": "openrouter/gpt-4o",
+            "query_optimizer": "openrouter/anthropic/claude-opus-4.6-fast",
+            "critic": "openrouter/openai/gpt-5.4-mini",
+            "red_team": "openrouter/openai/gpt-5.4-mini",
+            "decomposer": "openrouter/anthropic/claude-sonnet-4.6",
+            "summarizer": "openrouter/openai/gpt-5.2",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
