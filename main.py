@@ -44,6 +44,8 @@ from forecasting_tools import (
 )
 
 dotenv.load_dotenv()
+if not os.getenv("OPENAI_API_KEY") and os.getenv("OPENROUTER_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = os.getenv("OPENROUTER_API_KEY")
 logger = logging.getLogger(__name__)
 
 LOGS_DIR = Path("logs")
@@ -354,15 +356,14 @@ class Dezzy(ForecastBot):
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
 
     def _llm_config_defaults(self) -> Dict[str, str]:
-        free = "openrouter/openrouter/free"
         return {
-            "default": free,
-            "parser": "openrouter/gpt-4o",
-            "query_optimizer": "openrouter/claude-3-opus",
-            "critic": "openrouter/gpt-4o",
-            "red_team": "openrouter/claude-3-opus",
-            "decomposer": "openrouter/gpt-4o",
-            "summarizer": "openrouter/claude-3-opus",
+            "default":         "openrouter/openai/gpt-5.1",
+            "parser":          "openrouter/openai/gpt-4.1-mini",
+            "query_optimizer": "openrouter/anthropic/claude-sonnet-4.6",
+            "critic":          "openrouter/openai/gpt-5.2",
+            "red_team":        "openrouter/openai/gpt-5.1",
+            "decomposer":      "openrouter/anthropic/claude-sonnet-4.6",
+            "summarizer":      "openrouter/anthropic/claude-opus-4.6",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -769,7 +770,7 @@ class Dezzy(ForecastBot):
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace) -> Any:
         self._ensure_some_research_or_raise(research)
-        model = "openrouter/openai/gpt-4o"
+        model = "openrouter/openai/gpt-5.1"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
 
         if isinstance(question, BinaryQuestion):
