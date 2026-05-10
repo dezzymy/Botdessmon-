@@ -345,7 +345,14 @@ class Dezzy(ForecastBot):
             if os.getenv("TAVILY_API_KEY") else None
         )
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
-        self.asknews = AskNewsSDK(api_key=os.getenv("ASKNEWS_SECRET")) if os.getenv("ASKNEWS_SECRET") else None
+        self.asknews = (
+            AskNewsSDK(
+                client_id=os.getenv("ASKNEWS_CLIENT_ID"),
+                client_secret=os.getenv("ASKNEWS_CLIENT_SECRET"),
+            )
+            if os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_CLIENT_SECRET")
+            else None
+        )
 
         self._research_cache: Dict[str, str] = {}
         self._recent_binary_predictions: List[Tuple[str, float]] = []
@@ -356,7 +363,6 @@ class Dezzy(ForecastBot):
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
 
     def _llm_config_defaults(self) -> Dict[str, str]:
-        free = "openrouter/anthropic/claude-sonnet-4.6"
         return {
             "default":         "openrouter/openai/gpt-4.1",
             "parser":          "openrouter/openai/gpt-4.1-mini",
@@ -364,14 +370,7 @@ class Dezzy(ForecastBot):
             "critic":          "openrouter/openai/o3",
             "red_team":        "openrouter/openai/gpt-4.1",
             "decomposer":      "openrouter/anthropic/claude-sonnet-4-5",
-            "summarizer":      "openrouter/anthropic/claude-sonnet-4-5",
-            "default": free,
-            "parser": "openrouter/gpt-4o",
-            "query_optimizer": "openrouter/anthropic/claude-opus-4.6-fast",
-            "critic": "openrouter/openai/gpt-4o-mini",
-            "red_team": "openrouter/openai/gpt-4o-mini",
-            "decomposer": "openrouter/anthropic/claude-sonnet-4.6",
-            "summarizer": "openrouter/openai/gpt-4o",
+            "summarizer":      "openrouter/openai/gpt-4.1",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
