@@ -358,13 +358,13 @@ class Dezzy(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         free = "openrouter/anthropic/claude-sonnet-4.6"
         return {
-            "default":         "openrouter/openai/gpt-4o",
+            "default":         "openrouter/openai/gpt-4.1",
             "parser":          "openrouter/openai/gpt-4.1-mini",
-            "query_optimizer": "openrouter/anthropic/claude-sonnet-4.6",
-            "critic":          "openrouter/openai/gpt-4o",
-            "red_team":        "openrouter/openai/gpt-4o",
-            "decomposer":      "openrouter/anthropic/claude-sonnet-4.6",
-            "summarizer":      "openrouter/anthropic/claude-opus-4.6",
+            "query_optimizer": "openrouter/anthropic/claude-sonnet-4-5",
+            "critic":          "openrouter/openai/o3",
+            "red_team":        "openrouter/openai/gpt-4.1",
+            "decomposer":      "openrouter/anthropic/claude-sonnet-4-5",
+            "summarizer":      "openrouter/anthropic/claude-sonnet-4-5",
             "default": free,
             "parser": "openrouter/gpt-4o",
             "query_optimizer": "openrouter/anthropic/claude-opus-4.6-fast",
@@ -778,7 +778,7 @@ class Dezzy(ForecastBot):
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace) -> Any:
         self._ensure_some_research_or_raise(research)
-        model = "openrouter/gpt-5.1"
+        model = "openrouter/openai/gpt-4.1"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
 
         if isinstance(question, BinaryQuestion):
