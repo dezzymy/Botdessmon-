@@ -865,7 +865,6 @@ class Dezzy(ForecastBot):
         research_summary = await self._summarize_research(question, research)
         trace.add("Research summary", research_summary)
         quality = self._research_quality_weight(research)
-        trace.add("Research sources", f"{self._search_footprint(research)} | quality_weight={quality:.2f}")
 
         runs = await self._multi_run(question, research, trace)
         if not runs:
@@ -898,12 +897,10 @@ class Dezzy(ForecastBot):
             if "minibench" in self._active_tournament:
                 p_ext, eff_k, trigs = self._minibench_extremize_binary(combined, probs, research)
                 applied.append(f"extremize(mb: {trigs})")
-                trace.add("Minibench Extremize", f"k={eff_k} triggers=[{trigs}] | {combined:.4f} -> {p_ext:.4f}")
             elif self._extremize_gate(combined):
                 ext_strength = self._extremize_strength(research, probs + [combined], question)
                 p_ext = ForecastingPrinciples.extremize_logit(combined, ext_strength)
                 applied.append(f"extremize(x{ext_strength:.2f})")
-                trace.add("Extremize", f"gate=OPEN | strength={ext_strength:.3f} | {combined:.4f} -> {p_ext:.4f}")
             else:
                 p_ext = combined
                 applied.append("extremize(gated-off)")
