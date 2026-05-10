@@ -782,66 +782,44 @@ class Dezzy(ForecastBot):
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
 
         if isinstance(question, BinaryQuestion):
-            try:
-                raw = await llm.invoke(clean_indents(f"""
-                    You are a calibrated superforecaster. Think step by step before giving your answer.
-                    Question: {question.question_text}
-                    Resolution criteria: {question.resolution_criteria}
-                    Research: {research}
-                    Today is {datetime.now().strftime("%Y-%m-%d")}.
-                    OUTPUT ONLY VALID JSON on the very last line: {{"prediction_in_decimal": 0.50}}
-                """))
-            except Exception as e:
-                if "usage" in str(e):
-                    trace.add_narrative(run_index, "LLM failed due to usage parameter, using fallback.")
-                    return BinaryPrediction(prediction_in_decimal=0.5)
-                else:
-                    raise
+            raw = await llm.invoke(clean_indents(f"""
+                You are a calibrated superforecaster. Think step by step before giving your answer.
+                Question: {question.question_text}
+                Resolution criteria: {question.resolution_criteria}
+                Research: {research}
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                OUTPUT ONLY VALID JSON on the very last line: {{"prediction_in_decimal": 0.50}}
+            """))
             trace.add_narrative(run_index, "\n".join(line for line in (raw or "").splitlines() if not line.strip().startswith("{")).strip())
             return await structure_output(sanitize_llm_json(raw), BinaryPrediction, model=self.get_llm("parser", "llm"), num_validation_samples=1)
 
         if isinstance(question, MultipleChoiceQuestion):
             schema_example = json.dumps({"predicted_options": [{"option_name": opt, "probability": round(1 / len(question.options), 3)} for opt in question.options]})
-            try:
-                raw = await llm.invoke(clean_indents(f"""
-                    You are a calibrated superforecaster.
-                    Question: {question.question_text}
-                    Options: {question.options}
-                    Research: {research}
-                    Today is {datetime.now().strftime("%Y-%m-%d")}.
-                    OUTPUT ONLY VALID JSON on the very last line: {schema_example}
-                """))
-            except Exception as e:
-                if "usage" in str(e):
-                    trace.add_narrative(run_index, "LLM failed due to usage parameter, using fallback.")
-                    return PredictedOptionList(predicted_options=[{"option_name": opt, "probability": round(1 / len(question.options), 3)} for opt in question.options])
-                else:
-                    raise
+            raw = await llm.invoke(clean_indents(f"""
+                You are a calibrated superforecaster.
+                Question: {question.question_text}
+                Options: {question.options}
+                Research: {research}
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                OUTPUT ONLY VALID JSON on the very last line: {schema_example}
+            """))
             trace.add_narrative(run_index, "\n".join(line for line in (raw or "").splitlines() if not line.strip().startswith("{")).strip())
             return await structure_output(sanitize_llm_json(raw), PredictedOptionList, model=self.get_llm("parser", "llm"), num_validation_samples=1)
 
         if isinstance(question, NumericQuestion):
             upper = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
             lower = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
-            try:
-                raw = await llm.invoke(clean_indents(f"""
-                    You are a calibrated superforecaster.
-                    Question: {question.question_text}
-                    Units: {question.unit_of_measure or "Not stated"} | Bounds: [{lower}, {upper}]
-                    Research: {research}
-                    Today is {datetime.now().strftime("%Y-%m-%d")}.
-                    The LAST thing you write is EXACTLY these 6 lines:
-                    Percentile 10: XX
-                    ...
-                    Percentile 90: XX
-                """))
-            except Exception as e:
-                if "usage" in str(e):
-                    trace.add_narrative(run_index, "LLM failed due to usage parameter, using fallback.")
-                    pcts = self._bounds_fallback(question)
-                    return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning="Fallback due to LLM error.")
-                else:
-                    raise
+            raw = await llm.invoke(clean_indents(f"""
+                You are a calibrated superforecaster.
+                Question: {question.question_text}
+                Units: {question.unit_of_measure or "Not stated"} | Bounds: [{lower}, {upper}]
+                Research: {research}
+                Today is {datetime.now().strftime("%Y-%m-%d")}.
+                The LAST thing you write is EXACTLY these 6 lines:
+                Percentile 10: XX
+                ...
+                Percentile 90: XX
+            """))
             narrative_lines = []
             for line in (raw or "").splitlines():
                 if re.match(r"^\s*Percentile\s*(10|20|40|60|80|90)\s*:", line, re.IGNORECASE): break
