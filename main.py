@@ -778,7 +778,7 @@ class Dezzy(ForecastBot):
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace) -> Any:
         self._ensure_some_research_or_raise(research)
-        model = "openrouter/free"
+        model = "openrouter/gpt-5.1"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
 
         if isinstance(question, BinaryQuestion):
