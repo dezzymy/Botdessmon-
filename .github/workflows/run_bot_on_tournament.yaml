@@ -1,16 +1,13 @@
 name: Forecast on new AI tournament questions
-
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *" # runs every 30 minutes. Make sure to skip already forecasted questions!
-
+    # Runs every 35 minutes, 24 hours a day (GitHub Actions uses UTC)
+    - cron: "*/35 * * * *" 
 # Add concurrency group to prevent parallel runs
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
-
-
 # Daily job to run the simple forecast bot
 jobs:
   forecast_job:
