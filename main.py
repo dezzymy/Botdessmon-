@@ -365,10 +365,10 @@ class Dezzy(ForecastBot):
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
             "default":         "openrouter/openai/gpt-5.1",
-            "parser":          "openrouter/openai/gpt-5.1-mini",
+            "parser":          "openrouter/openai/gpt-4.1-mini",
             "query_optimizer": "openrouter/anthropic/claude-sonnet-4-5",
             "critic":          "openrouter/openai/o3",
-            "red_team":        "openrouter/openai/gpt-4.1",
+            "red_team":        "openrouter/openai/gpt-5.1",
             "decomposer":      "openrouter/anthropic/claude-sonnet-4-5",
             "summarizer":      "openrouter/openai/gpt-4.1",
         }
@@ -713,6 +713,12 @@ class Dezzy(ForecastBot):
     def _format_pcts(pcts: List[Percentile]) -> str:
         return " | ".join(f"P{int(round(float(p.percentile) * 100))}={p.value:.6g}" for p in pcts)
 
+    @staticmethod
+    def _p10_p90(pcts: List[Percentile]) -> Tuple[Optional[float], Optional[float]]:
+        """Extract P10 and P90 values from a list of Percentile objects."""
+        by = {round(float(p.percentile), 3): float(p.value) for p in pcts}
+        return by.get(0.1), by.get(0.9)
+
     async def _parse_numeric_percentiles_robust(self, question: NumericQuestion, text: str, stage: str) -> List[Percentile]:
         parser_llm = self.get_llm("parser", "llm")
         for attempt, source in enumerate([text, self._extract_percentile_block(text)], 1):
@@ -989,8 +995,8 @@ class Dezzy(ForecastBot):
                 return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render())
 
         agg = self._enforce_monotone(agg)
-        
-        # Calculate Numeric relative spread for Spring AI Gate
+
+        # Calculate numeric relative spread for Spring AI Gate
         p10, p90 = self._p10_p90(agg)
         med = self._median_from_40_60(agg)
         rel_spread = (p90 - p10) / abs(med) if p10 is not None and p90 is not None and med != 0 else 0.0
