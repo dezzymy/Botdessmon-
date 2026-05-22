@@ -364,8 +364,8 @@ class Dezzy(ForecastBot):
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
-            "default":         "openrouter/openai/gpt-4.1",
-            "parser":          "openrouter/openai/gpt-4.1-mini",
+            "default":         "openrouter/openai/gpt-5.1",
+            "parser":          "openrouter/openai/gpt-5.1-mini",
             "query_optimizer": "openrouter/anthropic/claude-sonnet-4-5",
             "critic":          "openrouter/openai/o3",
             "red_team":        "openrouter/openai/gpt-4.1",
