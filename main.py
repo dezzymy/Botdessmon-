@@ -405,6 +405,45 @@ class Dezzy(ForecastBot):
         if srcs == "none": return 0.25
         return {1: 0.65, 2: 0.82}.get(len(srcs.split(",")), 0.7)
 
+    def _grounding_instructions(self) -> str:
+        return (
+            "You are Dezzy, an evidence-based forecasting assistant. "
+            f"Current date (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d')}. "
+            "Do not rely on model memory or training cutoff for recent events. "
+            "Ground every forecast in the supplied research, direct evidence, and any credible source context provided. "
+            "If the evidence is weak or stale, say so explicitly and avoid overclaiming."
+        )
+
+    def _build_grounded_context(self, question: MetaculusQuestion, research: str, premortem: str) -> str:
+        return clean_indents(f"""
+            Question: {getattr(question, 'question_text', '')}
+            Resolution criteria: {getattr(question, 'resolution_criteria', '')}
+
+            Grounding instructions:
+            {self._grounding_instructions()}
+
+            Research briefing:
+            {research}
+
+            Premortem analysis:
+            {premortem}
+        """)
+
+    async def _run_premortem_analysis(self, question: MetaculusQuestion, research: str) -> str:
+        try:
+            llm = self.get_llm("critic", "llm")
+            prompt = clean_indents(f"""
+                Imagine the correct answer is the opposite of your best guess.
+                List 3 plausible, evidence-based reasons you could be wrong.
+                {self._grounding_instructions()}
+                Question: {question.question_text}
+                Research: {research[:4000]}
+            """)
+            return (await llm.invoke(prompt)).strip() or "Premortem unavailable."
+        except Exception as e:
+            logger.warning(f"Premortem analysis failed: {e}")
+            return "Premortem unavailable."
+
     async def _decompose_question(self, question: MetaculusQuestion) -> Optional[DecompositionOutput]:
         if not self.flags.enable_decomposition: return None
         try:
@@ -781,17 +820,20 @@ class Dezzy(ForecastBot):
     # Model calls + multi-run
     # ──────────────────────────────────────────────────────────────────────────
 
-    async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace) -> Any:
+    async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace, grounded_context: Optional[str] = None) -> Any:
         self._ensure_some_research_or_raise(research)
         model = "openrouter/openai/o3"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
+        context = grounded_context or self._build_grounded_context(question, research, "Premortem unavailable.")
 
         if isinstance(question, BinaryQuestion):
             raw = await llm.invoke(clean_indents(f"""
                 You are a calibrated superforecaster. Think step by step before giving your answer.
+                {self._grounding_instructions()}
                 Question: {question.question_text}
                 Resolution criteria: {question.resolution_criteria}
-                Research: {research}
+                Context:
+                {context}
                 Today is {datetime.now().strftime("%Y-%m-%d")}.
                 OUTPUT ONLY VALID JSON on the very last line: {{"prediction_in_decimal": 0.50}}
             """))
@@ -802,9 +844,11 @@ class Dezzy(ForecastBot):
             schema_example = json.dumps({"predicted_options": [{"option_name": opt, "probability": round(1 / len(question.options), 3)} for opt in question.options]})
             raw = await llm.invoke(clean_indents(f"""
                 You are a calibrated superforecaster.
+                {self._grounding_instructions()}
                 Question: {question.question_text}
                 Options: {question.options}
-                Research: {research}
+                Context:
+                {context}
                 Today is {datetime.now().strftime("%Y-%m-%d")}.
                 OUTPUT ONLY VALID JSON on the very last line: {schema_example}
             """))
@@ -816,9 +860,11 @@ class Dezzy(ForecastBot):
             lower = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
             raw = await llm.invoke(clean_indents(f"""
                 You are a calibrated superforecaster.
+                {self._grounding_instructions()}
                 Question: {question.question_text}
                 Units: {question.unit_of_measure or "Not stated"} | Bounds: [{lower}, {upper}]
-                Research: {research}
+                Context:
+                {context}
                 Today is {datetime.now().strftime("%Y-%m-%d")}.
                 The LAST thing you write is EXACTLY these 6 lines:
                 Percentile 10: XX
@@ -834,11 +880,11 @@ class Dezzy(ForecastBot):
 
         raise TypeError(f"Unsupported question type: {type(question)}")
 
-    async def _multi_run(self, question: MetaculusQuestion, research: str, trace: ReasoningTrace) -> List[Any]:
+    async def _multi_run(self, question: MetaculusQuestion, research: str, trace: ReasoningTrace, grounded_context: Optional[str] = None) -> List[Any]:
         outs: List[Any] = []
         for i in range(self.runs_per_question):
             try:
-                outs.append(await self._single_model_forecast(question, research, i + 1, trace))
+                outs.append(await self._single_model_forecast(question, research, i + 1, trace, grounded_context=grounded_context))
             except Exception as e:
                 logger.warning(f"run {i+1}/{self.runs_per_question} failed: {e}")
                 trace.add(f"Run {i+1}", f"FAILED: {e}")
@@ -870,9 +916,12 @@ class Dezzy(ForecastBot):
 
         research_summary = await self._summarize_research(question, research)
         trace.add("Research summary", research_summary)
+        premortem = await self._run_premortem_analysis(question, research)
+        trace.add("Premortem", premortem[:1200])
+        grounded_context = self._build_grounded_context(question, research, premortem)
         quality = self._research_quality_weight(research)
 
-        runs = await self._multi_run(question, research, trace)
+        runs = await self._multi_run(question, research, trace, grounded_context=grounded_context)
         if not runs:
             return self._fallback_binary_prediction(question, trace)
 
@@ -937,9 +986,12 @@ class Dezzy(ForecastBot):
         trace = ReasoningTrace(question.question_text, self.bot_name)
 
         trace.add("Research summary", await self._summarize_research(question, research))
+        premortem = await self._run_premortem_analysis(question, research)
+        trace.add("Premortem", premortem[:1200])
+        grounded_context = self._build_grounded_context(question, research, premortem)
         quality = self._research_quality_weight(research)
 
-        runs = await self._multi_run(question, research, trace)
+        runs = await self._multi_run(question, research, trace, grounded_context=grounded_context)
         if not runs:
             return self._fallback_mc_prediction(question, trace)
 
@@ -971,9 +1023,12 @@ class Dezzy(ForecastBot):
         trace = ReasoningTrace(question.question_text, self.bot_name)
 
         trace.add("Research summary", await self._summarize_research(question, research))
+        premortem = await self._run_premortem_analysis(question, research)
+        trace.add("Premortem", premortem[:1200])
+        grounded_context = self._build_grounded_context(question, research, premortem)
         quality = self._research_quality_weight(research)
 
-        runs = await self._multi_run(question, research, trace)
+        runs = await self._multi_run(question, research, trace, grounded_context=grounded_context)
         if not runs: raise RuntimeError("All numeric runs failed.")
 
         required = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
@@ -1008,6 +1063,9 @@ class Dezzy(ForecastBot):
     async def _forecast_numeric_partial_reveal(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
         trace = ReasoningTrace(question.question_text, self.bot_name)
         trace.add("Research summary", await self._summarize_research(question, research))
+        premortem = await self._run_premortem_analysis(question, research)
+        trace.add("Premortem", premortem[:1200])
+        grounded_context = self._build_grounded_context(question, research, premortem)
         
         try: ex = await self._llm_extract_partial_reveal(question, research)
         except Exception: return await self._run_forecast_on_numeric_generic(question, research)
@@ -1032,6 +1090,9 @@ class Dezzy(ForecastBot):
     async def _forecast_numeric_structured_ts(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
         trace = ReasoningTrace(question.question_text, self.bot_name)
         trace.add("Research summary", await self._summarize_research(question, research))
+        premortem = await self._run_premortem_analysis(question, research)
+        trace.add("Premortem", premortem[:1200])
+        grounded_context = self._build_grounded_context(question, research, premortem)
 
         baseline = 0.5 * (float(question.lower_bound) + float(question.upper_bound))
         try:
