@@ -371,6 +371,9 @@ class Dezzy(ForecastBot):
             "red_team":        "openrouter/openai/gpt-5.1",
             "decomposer":      "openrouter/anthropic/claude-sonnet-4-5",
             "summarizer":      "openrouter/openai/gpt-4.1",
+            "researcher":      "openrouter/openai/gpt-oss-120b",
+            "online_researcher": "openrouter/openai/gpt-oss-120b",
+            "research_synthesizer": "openrouter/openai/gpt-oss-120b",
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -389,13 +392,13 @@ class Dezzy(ForecastBot):
             used.append("asknews")
         if ok("[MiMo Research]", ["[MiMo research failed]"]):
             used.append("mimo")
-        if ok("[Sonar Research]", ["[Sonar research failed]"]):
-            used.append("sonar")
+        if ok("[GPT-OSS Research]", ["[GPT-OSS research failed]"]):
+            used.append("gptoss")
         return ",".join(used) if used else "none"
 
     def _ensure_some_research_or_raise(self, research: str) -> None:
         if self._search_footprint(research) == "none":
-            raise RuntimeError("No research evidence available (Tavily and Exa both failed or not configured).")
+            raise RuntimeError("No research evidence available (Tavily research failed or not configured).")
 
     def _research_quality_weight(self, research: str) -> float:
         srcs = self._search_footprint(research)
@@ -479,11 +482,11 @@ class Dezzy(ForecastBot):
             logger.error(f"MiMo research failed: {e}")
             return "[MiMo research failed]"
 
-    async def _run_sonar_research(self, question: MetaculusQuestion, research: str) -> str:
+    async def _run_gptoss_research(self, question: MetaculusQuestion, research: str) -> str:
         try:
-            llm = GeneralLlm(model="openrouter/perplexity/sonar-reasoning-pro", temperature=0.1)
+            llm = GeneralLlm(model="openrouter/openai/gpt-oss-120b", temperature=0.1)
             prompt = clean_indents(f"""
-                You are a research assistant. Research this forecasting question using your knowledge and provide:
+                You are a research assistant. Research this forecasting question using the Tavily results and your knowledge and provide:
                 1. Key factual findings.
                 2. Signals supporting YES/higher outcome.
                 3. Signals supporting NO/lower outcome.
@@ -491,10 +494,10 @@ class Dezzy(ForecastBot):
                 Existing research: {research[:2000] if research else 'None'}
             """)
             response = await llm.invoke(prompt)
-            return f"[Sonar Research]\n{response.strip()}"
+            return f"[GPT-OSS Research]\n{response.strip()}"
         except Exception as e:
-            logger.error(f"Sonar research failed: {e}")
-            return "[Sonar research failed]"
+            logger.error(f"GPT-OSS research failed: {e}")
+            return "[GPT-OSS research failed]"
 
     async def _summarize_research(self, question: MetaculusQuestion, raw_research: str) -> str:
         llm = self.get_llm("summarizer", "llm")
@@ -530,10 +533,7 @@ class Dezzy(ForecastBot):
 
         results = await asyncio.gather(
             self._run_tavily_search(optimized_query),
-            self._run_exa_search(optimized_query),
-            self._run_asknews_search(optimized_query),
-            self._run_mimo_research(question, ""),
-            self._run_sonar_research(question, ""),
+            self._run_gptoss_research(question, ""),
             return_exceptions=True
         )
         cleaned = [f"[Search failed: {str(res)}]" if isinstance(res, Exception) else res for res in results]

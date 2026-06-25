@@ -66,9 +66,9 @@ class Dezzy(ForecastBot):
     def _llm_config_defaults(self) -> dict[str, str]:
         return {
             "summarizer": "openrouter/openai/gpt-4o-mini",
-            "researcher": "openrouter/openai/gpt-4o-search-preview",
+            "researcher": "openrouter/openai/gpt-oss-120b",
             "online_researcher": "openrouter/openai/gpt-oss-120b",
-            "research_synthesizer": "openrouter/openai/gpt-4o",
+            "research_synthesizer": "openrouter/openai/gpt-oss-120b",
             "pre_mortem_agent": "openrouter/openai/gpt-5",
             "pre_parade_agent": "openrouter/openai/gpt-4.1",
             "advocate_agent": "openrouter/openai/gpt-4.1-nano",
@@ -180,17 +180,11 @@ class Dezzy(ForecastBot):
                 if finance_context:
                     raw_research_dump += f"--- RAW DATA FROM: YFINANCE ({finance_ticker}) ---\n{finance_context}\n\n"
 
-            tasks = {
-                "tavily": loop.run_in_executor(None, self.call_tavily, question.question_text),
-                "online_sources": self.get_llm("online_researcher", "llm").invoke(question.question_text)
-            }
-            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-            source_names = list(tasks.keys())
-            for i, result in enumerate(results):
-                raw_research_dump += f"--- RAW DATA FROM: {source_names[i].upper()} ---\n{result}\n\n"
+            tavily_results = await loop.run_in_executor(None, self.call_tavily, question.question_text)
+            raw_research_dump = f"--- RAW DATA FROM: TAVILY ---\n{tavily_results}\n\n"
             synthesis_prompt = clean_indents(f"""
             {self._grounding_instructions()}
-            Synthesize into a clean intelligence briefing.
+            Synthesize into a clean intelligence briefing using only the Tavily research supplied below.
 
             Question: {question.question_text}
             Raw Data Dump:
@@ -376,7 +370,7 @@ if __name__ == "__main__":
         "--tournament-ids",
         nargs="+",
         type=str,
-        default=["33022", "market-pulse-26q2", MetaculusApi.CURRENT_MINIBENCH_ID],
+        default=["33022", "market-pulse-26q2"],
         help="Tournament IDs to forecast on",
     )
     args = parser.parse_args()
