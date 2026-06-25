@@ -67,7 +67,7 @@ class Dezzy(ForecastBot):
         return {
             "summarizer": "openrouter/openai/gpt-4o-mini",
             "researcher": "openrouter/openai/gpt-4o-search-preview",
-            "online_researcher": "openrouter/perplexity/sonar",
+            "online_researcher": "openrouter/openai/gpt-oss-120b",
             "research_synthesizer": "openrouter/openai/gpt-4o",
             "pre_mortem_agent": "openrouter/openai/gpt-5",
             "pre_parade_agent": "openrouter/openai/gpt-4.1",
@@ -385,7 +385,7 @@ if __name__ == "__main__":
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
     )
 
     try:
