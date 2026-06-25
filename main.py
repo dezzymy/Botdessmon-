@@ -1100,7 +1100,7 @@ if __name__ == "__main__":
 
     bot = Dezzy(
         research_reports_per_question=1, predictions_per_research_report=1,
-        publish_reports_to_metaculus=True, skip_previously_forecasted_questions=True,
+        publish_reports_to_metaculus=True, skip_previously_forecasted_questions=False,
         bot_name=args.bot_name, flags=flags, runs_per_question=max(1, int(args.runs)),
     )
 
