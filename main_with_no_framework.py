@@ -74,8 +74,8 @@ class Dezzy(ForecastBot):
             "advocate_agent": "openrouter/openai/gpt-4.1-nano",
             "risk_synthesizer": "openrouter/openai/gpt-5",
             "synthesizer_1": "openrouter/openai/o3",
-            "synthesizer_2": "openrouter/openai/gpt-5",
-            "synthesizer_3": "openrouter/anthropic/claude-sonnet-4",
+            "synthesizer_2": "openrouter/openai/gpt-oss-120b",
+            "synthesizer_3": "openrouter/openai/gpt-oss-120b",
         }
 
     def __init__(self, *args, **kwargs):
