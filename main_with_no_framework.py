@@ -7,10 +7,10 @@ import json
 import logging
 import os
 import warnings
+from datetime import date, datetime, timezone
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-import requests
 from forecasting_tools import (
     BinaryPrediction,
     BinaryQuestion,
@@ -28,14 +28,17 @@ from forecasting_tools import (
 )
 
 from tavily import TavilyClient
-from newsapi import NewsApiClient
+
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
 
 # -----------------------------
 # Environment & API Keys
 # -----------------------------
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-NEWSAPI_API_KEY = os.getenv("NEWSAPI_API_KEY")
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
 
 # -----------------------------
 # Logging setup
@@ -44,7 +47,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("HybridPreMortemBot")
+logger = logging.getLogger("Dezzy")
 
 # -----------------------------
 # Suppress noisy warnings
@@ -52,7 +55,7 @@ logger = logging.getLogger("HybridPreMortemBot")
 warnings.filterwarnings("ignore", message=".*does not support cost tracking.*")
 
 
-class HybridPreMortemBot(ForecastBot):
+class Dezzy(ForecastBot):
     """
     Tournament-only bot with strict compliance to forecasting_tools schema.
     """
@@ -78,9 +81,62 @@ class HybridPreMortemBot(ForecastBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
-        self.newsapi_client = NewsApiClient(api_key=NEWSAPI_API_KEY)
-        self.serpapi_key = SERPAPI_API_KEY
-        logger.info("Initialized HybridPreMortemBot in tournament-only mode.")
+        logger.info("Initialized Dezzy in tournament-only mode.")
+
+    @staticmethod
+    def _current_date_context() -> str:
+        now = datetime.now(timezone.utc)
+        return f"Current date (UTC): {now.strftime('%Y-%m-%d')}"
+
+    def _grounding_instructions(self) -> str:
+        return (
+            "You are Dezzy, an evidence-based forecasting assistant. "
+            f"{self._current_date_context()}. "
+            "Do not rely on your model's training cutoff or internal memory for recent events. "
+            "Ground every forecast in the supplied research, Tavily results, and any other online sources provided. "
+            "If the evidence is weak or stale, say so explicitly and avoid overclaiming."
+        )
+
+    def _is_finance_question(self, question_text: str) -> bool:
+        text = question_text.lower()
+        finance_keywords = [
+            "stock", "stocks", "share", "shares", "market", "price", "earnings", "revenue",
+            "gdp", "inflation", "bond", "yield", "spread", "treasury", "interest rate",
+            "fed", "nasdaq", "s&p", "dow", "oil", "commodity", "currency", "crypto"
+        ]
+        return any(keyword in text for keyword in finance_keywords)
+
+    def _fetch_yfinance_data_sync(self, ticker: str) -> str:
+        if not YFINANCE_AVAILABLE or not ticker or ticker.upper() == "NONE":
+            return ""
+        try:
+            tk = yf.Ticker(ticker)
+            hist = tk.history(period="3mo")
+            if hist.empty:
+                return ""
+            spot = hist["Close"].iloc[-1]
+            return (
+                f"--- YAHOO FINANCE DATA ({ticker}) ---\n"
+                f"Latest close: {spot:.2f}\n"
+                f"Source: Yahoo Finance\n"
+            )
+        except Exception:
+            return ""
+
+    async def _extract_yfinance_ticker(self, question: MetaculusQuestion) -> str:
+        prompt = clean_indents(f"""
+        Extract the single most relevant Yahoo Finance ticker for this question.
+        If there is no clear ticker, reply NONE.
+
+        Question: {question.question_text}
+        Examples: AAPL, ^GSPC, CL=F, BTC-USD
+        """)
+        try:
+            response = await self.get_llm("researcher", "llm").invoke(prompt)
+            ticker = response.strip().splitlines()[0].strip().upper()
+            return ticker if ticker and ticker != "NONE" else ""
+        except Exception:
+            return ""
 
     def _get_synth_models_for_question(self, question: MetaculusQuestion) -> List[str]:
         text = question.question_text.lower()
@@ -96,6 +152,7 @@ class HybridPreMortemBot(ForecastBot):
         Imagine the correct answer is the opposite of your best guess.
         List 3 plausible, evidence-based reasons why you could be wrong.
 
+        {self._grounding_instructions()}
         Question: {question.question_text}
         Research: {research[:1000]}...
         """)
@@ -111,44 +168,31 @@ class HybridPreMortemBot(ForecastBot):
             return "\n".join([f"- {c['content']}" for c in response['results']])
         except Exception as e: return f"Tavily search failed: {e}"
 
-    def call_newsapi(self, query: str) -> str:
-        if not self.newsapi_client.api_key: return "NewsAPI search not performed."
-        try:
-            articles = self.newsapi_client.get_everything(q=query, language='en', sort_by='relevancy', page_size=5)
-            if not articles or not articles.get('articles'): return "No recent news articles found."
-            return "\n".join([f"- Title: {a['title']}\n  Snippet: {a.get('description', 'N/A')}" for a in articles['articles']])
-        except Exception as e: return f"NewsAPI search failed: {e}"
-
-    def call_serpapi(self, query: str) -> str:
-        if not self.serpapi_key: return "SerpApi search not performed."
-        url = "https://serpapi.com/search.json"
-        params = {"q": query, "api_key": self.serpapi_key}
-        try:
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            snippets = [result.get('snippet', '') for result in data.get('organic_results', [])]
-            return "\n".join([f"- {s}" for s in snippets if s])
-        except Exception as e: return f"SerpApi search failed: {e}"
-
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            logger.info(f"--- Starting All-Source Research for: {question.question_text} ---")
+            logger.info(f"--- Starting Tavily Research for: {question.question_text} ---")
             loop = asyncio.get_running_loop()
+            raw_research_dump = ""
+            finance_ticker = ""
+            if self._is_finance_question(question.question_text):
+                finance_ticker = await self._extract_yfinance_ticker(question)
+                finance_context = self._fetch_yfinance_data_sync(finance_ticker)
+                if finance_context:
+                    raw_research_dump += f"--- RAW DATA FROM: YFINANCE ({finance_ticker}) ---\n{finance_context}\n\n"
+
             tasks = {
                 "tavily": loop.run_in_executor(None, self.call_tavily, question.question_text),
-                "newsapi": loop.run_in_executor(None, self.call_newsapi, question.question_text),
-                "serpapi": loop.run_in_executor(None, self.call_serpapi, question.question_text),
-                "perplexity": self.get_llm("online_researcher", "llm").invoke(question.question_text)
+                "online_sources": self.get_llm("online_researcher", "llm").invoke(question.question_text)
             }
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
             source_names = list(tasks.keys())
-            raw_research_dump = ""
             for i, result in enumerate(results):
                 raw_research_dump += f"--- RAW DATA FROM: {source_names[i].upper()} ---\n{result}\n\n"
             synthesis_prompt = clean_indents(f"""
+            {self._grounding_instructions()}
             Synthesize into a clean intelligence briefing.
 
+            Question: {question.question_text}
             Raw Data Dump:
             {raw_research_dump}
 
@@ -161,6 +205,7 @@ class HybridPreMortemBot(ForecastBot):
     # -----------------------------
     async def _single_binary_forecast(self, synthesizer_key: str, question: BinaryQuestion, context: str) -> Dict[str, Any]:
         prompt = clean_indents(f"""
+        {self._grounding_instructions()}
         Estimate probability (0.0–1.0) that the event occurs.
 
         Question: {question.question_text}
@@ -181,6 +226,7 @@ class HybridPreMortemBot(ForecastBot):
     async def _single_mc_forecast(self, synthesizer_key: str, question: MultipleChoiceQuestion, context: str) -> Dict[str, Any]:
         options_str = "\n".join([f"- {opt}" for opt in question.options])
         prompt = clean_indents(f"""
+        {self._grounding_instructions()}
         Assign probabilities to each option (sum to 1.0).
 
         Question: {question.question_text}
@@ -209,6 +255,7 @@ class HybridPreMortemBot(ForecastBot):
     async def _single_numeric_forecast(self, synthesizer_key: str, question: NumericQuestion, context: str) -> Dict[str, Any]:
         unit_info = getattr(question, 'unit', getattr(question, 'units', 'Not specified'))
         prompt = clean_indents(f"""
+        {self._grounding_instructions()}
         Provide 10th, 50th, 90th percentiles.
 
         Question: {question.question_text}
@@ -324,7 +371,7 @@ class HybridPreMortemBot(ForecastBot):
 # Entrypoint — Tournament Only
 # -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Hybrid Pre-Mortem Bot on tournaments.")
+    parser = argparse.ArgumentParser(description="Run Dezzy on tournaments.")
     parser.add_argument(
         "--tournament-ids",
         nargs="+",
@@ -334,7 +381,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    bot = HybridPreMortemBot(
+    bot = Dezzy(
         research_reports_per_question=1,
         predictions_per_research_report=1,
         publish_reports_to_metaculus=True,
