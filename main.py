@@ -362,6 +362,10 @@ class Dezzy(ForecastBot):
         self._active_tournament = str(tid).strip().lower()
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
 
+    @staticmethod
+    def default_tournament_ids() -> List[str]:
+        return ["33022", "market-pulse-26q2"]
+
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
             "default":         "openrouter/openai/gpt-5.1",
@@ -642,29 +646,6 @@ class Dezzy(ForecastBot):
     def _extremize_gate(p: float) -> bool:
         p = float(p)
         return 0.02 < p < 0.98 and p != 0.5
-
-    def _minibench_extremize_binary(self, blend: float, probs: List[float], research: str) -> Tuple[float, float, str]:
-        agree = all(p > 0.5 for p in probs) or all(p < 0.5 for p in probs) if probs else False
-        strong = len(self._CONVICTION_RE.findall(research or "")) >= 2
-        in_zone = 0.44 <= blend <= 0.52
-
-        if in_zone and agree and strong:
-            pos = blend > 0.50
-            result = 0.82 if pos else 0.18
-            return result, 7.0, f"T5({'pos' if pos else 'neg'} {blend:.3f}->{result:.3f})"
-
-        k = 5.0
-        triggers = ["T1(base)"]
-        if agree:
-            k = min(k + 1.0, 7.0); triggers.append("T2(agree)")
-        if strong:
-            k = min(k + 1.0, 7.0); triggers.append("T3(research)")
-
-        result = ForecastingPrinciples.extremize_logit(blend, k)
-        if 0.40 <= result <= 0.60:
-            result = float(np.clip(ForecastingPrinciples.sigmoid(1.5 * ForecastingPrinciples.logit(result)), 0.01, 0.99))
-            triggers.append("T4(gate)")
-        return result, k, "+".join(triggers)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Red-team & Consistency
@@ -947,12 +928,9 @@ class Dezzy(ForecastBot):
             combined = 0.5 * combined + 0.5 * 0.5
             applied.append("consistency-shrink")
 
-        # Dynamic Extremize (Minibench or Standard)
+        # Dynamic Extremize
         if self.flags.enable_extremize:
-            if "minibench" in self._active_tournament:
-                p_ext, eff_k, trigs = self._minibench_extremize_binary(combined, probs, research)
-                applied.append(f"extremize(mb: {trigs})")
-            elif self._extremize_gate(combined):
+            if self._extremize_gate(combined):
                 ext_strength = self._extremize_strength(research, probs + [combined], question)
                 p_ext = ForecastingPrinciples.extremize_logit(combined, ext_strength)
                 applied.append(f"extremize(x{ext_strength:.2f})")
@@ -1139,7 +1117,7 @@ class Dezzy(ForecastBot):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    parser = argparse.ArgumentParser(description="dezzy: Tavily+Exa, OpenRouter, YFinance, Minibench Extremize, Spring AI Gate")
+    parser = argparse.ArgumentParser(description="dezzy: Tavily+Exa, OpenRouter, YFinance, and Spring AI Gate")
     parser.add_argument("--mode", type=str, choices=["tournament", "metaculus_cup", "test_questions"], default="tournament")
     parser.add_argument("--bot-name", type=str, default="dezzy")
     parser.add_argument("--runs", type=int, default=3, help="Number of independent agent runs to aggregate per question")
@@ -1169,14 +1147,11 @@ if __name__ == "__main__":
 
     async def run_all():
         if args.mode == "tournament":
-            bot.set_active_tournament("33022")
-            seasonal_task = bot.forecast_on_tournament(33022, return_exceptions=True)
-            
-            bot.set_active_tournament(str(client.CURRENT_MINIBENCH_ID))
-            minibench_task = bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True)
-            
-            seasonal, minibench = await asyncio.gather(seasonal_task, minibench_task)
-            return seasonal + minibench
+            reports: List[Any] = []
+            for tid in Dezzy.default_tournament_ids():
+                bot.set_active_tournament(tid)
+                reports.extend(await bot.forecast_on_tournament(tid, return_exceptions=True))
+            return reports
 
         if args.mode == "metaculus_cup":
             bot.skip_previously_forecasted_questions = False

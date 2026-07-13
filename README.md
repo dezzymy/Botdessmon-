@@ -1,5 +1,29 @@
-# Simple Metaculus forecasting bot
-This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/aib/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
+# Dezzy forecasting bot
+This repository contains Dezzy, a research-first forecasting bot for Metaculus-style questions. It is designed to gather evidence, run multiple independent model passes, and submit a calibrated probability without routing forecasts to an extra benchmark tournament.
+
+## How the bot works
+For each question, Dezzy:
+1. Collects evidence from Tavily, Exa, AskNews, and optional YFinance market data.
+2. Builds a grounded context block with a research summary and a premortem analysis.
+3. Runs several independent agent passes, then aggregates them with a median-based blend.
+4. Applies a confidence gate, red-team critique, consistency check, time decay, and optional extremization before emitting a final probability.
+
+The current default run targets the main Metaculus tournaments and does not submit forecasts to an extra benchmark tournament.
+
+## Models involved
+The bot uses a routed OpenRouter setup with specialized roles:
+- `default`: `openrouter/openai/gpt-5.1`
+- `parser`: `openrouter/openai/gpt-4.1-mini`
+- `query_optimizer`: `openrouter/anthropic/claude-sonnet-4-5`
+- `critic`: `openrouter/openai/o3`
+- `red_team`: `openrouter/openai/gpt-5.1`
+- `decomposer`: `openrouter/anthropic/claude-sonnet-4-5`
+- `summarizer`: `openrouter/openai/gpt-4.1`
+- `researcher`: `openrouter/openai/gpt-oss-120b`
+- `online_researcher`: `openrouter/openai/gpt-oss-120b`
+- `research_synthesizer`: `openrouter/openai/gpt-oss-120b`
+
+Go to https://www.metaculus.com/aib/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 
 In this project are 2 files:
 - **main.py**: Our recommended template option that uses [forecasting-tools](https://github.com/Metaculus/forecasting-tools) package to handle a lot of stuff in the background for you (such as API calls). We will update the package, thus allowing you to gain new features with minimal changes to your code.

@@ -21,6 +21,12 @@ class GroundedPremortemTests(unittest.TestCase):
         self.assertIn("The plan could fail due to staffing.", context)
         self.assertIn("Question:", context)
 
+    def test_default_tournaments_exclude_extra_benchmark(self):
+        tournaments = Dezzy.default_tournament_ids()
+
+        self.assertIn("33022", tournaments)
+        self.assertNotIn("benchmark", [t.lower() for t in tournaments])
+
 
 if __name__ == "__main__":
     unittest.main()
