@@ -471,9 +471,22 @@ class Dezzy(ForecastBot):
     # Every slug below was checked against
     # https://openrouter.ai/api/v1/models/<id>/endpoints and resolves.
     FORECASTER_MODELS: List[str] = [
-        "openrouter/anthropic/claude-opus-5",          # BTF-3 best single model
-        "openrouter/openai/gpt-5.6-sol",               # BTF-3 best available OpenAI
-        "openrouter/google/gemini-3.1-pro-preview",    # third family; NOT on BTF-3
+        "openrouter/anthropic/claude-opus-5",          # BTF-3 best single model, 0.116
+        "openrouter/openai/gpt-5.6-sol",               # BTF-3 best available OpenAI, 0.135
+        "openrouter/anthropic/claude-opus-4.8",        # BTF-3 0.130; see note below
+    ]
+    # Probed by --model-check so reachability of alternates is measured rather than
+    # assumed. google/gemini-3.1-pro-preview would give a third vendor family, but
+    # it returned 429 on this account and Google has no non-preview pro slug on
+    # OpenRouter, which is not something to hang a 35-minute cron on. Pass 3 is
+    # therefore a different Anthropic generation: measured on BTF-3 and stable, at
+    # the cost of more correlation with pass 1 than a third family would give.
+    FORECASTER_CANDIDATES: List[str] = [
+        "openrouter/google/gemini-3.1-pro-preview",
+        "openrouter/x-ai/grok-4.5",
+        "openrouter/anthropic/claude-fable-5",
+        "openrouter/openai/gpt-5.5",
+        "openrouter/anthropic/claude-sonnet-5",
     ]
 
     def _llm_config_defaults(self) -> Dict[str, str]:
@@ -485,9 +498,12 @@ class Dezzy(ForecastBot):
             "red_team":        "openrouter/anthropic/claude-opus-5",
             "decomposer":      "openrouter/anthropic/claude-sonnet-5",
             "summarizer":      "openrouter/openai/gpt-4.1-mini",
-            "researcher":      "openrouter/openai/gpt-oss-120b",
-            "online_researcher": "openrouter/openai/gpt-oss-120b",
-            "research_synthesizer": "openrouter/openai/gpt-oss-120b",
+            # gpt-oss-120b 404s on this OpenRouter account ("No allowed providers
+            # are available for the selected model"), which is why the recall step
+            # logged "GPT-OSS research failed" on live runs. Verified reachable.
+            "researcher":      "openrouter/openai/gpt-4.1-mini",
+            "online_researcher": "openrouter/openai/gpt-4.1-mini",
+            "research_synthesizer": "openrouter/openai/gpt-4.1-mini",
         }
 
     @property
@@ -510,7 +526,7 @@ class Dezzy(ForecastBot):
         "asknews": "[AskNews Results]",
     }
     _MODEL_RECALL_TAGS = {
-        "gptoss": "[GPT-OSS Research]",
+        "synthesis": "[Model Synthesis]",
         "mimo": "[MiMo Research]",
     }
 
@@ -756,9 +772,17 @@ class Dezzy(ForecastBot):
             logger.error(f"MiMo research failed: {e}")
             return "[MiMo research failed]"
 
-    async def _run_gptoss_research(self, question: MetaculusQuestion, research: str) -> str:
+    async def _run_model_synthesis(self, question: MetaculusQuestion, research: str) -> str:
+        """Second pass over the retrieved evidence by the `researcher` role.
+
+        Was _run_gptoss_research with the model hardcoded to gpt-oss-120b, which
+        404s on this account, so it returned "[GPT-OSS research failed]" on every
+        live run. It is now routed through the configured role, and the tag no
+        longer names a model it does not use. It is a synthesis step, not a source:
+        see _WEB_SOURCE_TAGS.
+        """
         try:
-            llm = GeneralLlm(model="openrouter/openai/gpt-oss-120b", temperature=0.1)
+            llm = self.get_llm("researcher", "llm")
             prompt = clean_indents(f"""
                 You are a research assistant. Research this forecasting question using the Tavily results and your knowledge and provide:
                 1. Key factual findings.
@@ -768,10 +792,10 @@ class Dezzy(ForecastBot):
                 Existing research: {research[:2000] if research else 'None'}
             """)
             response = await llm.invoke(prompt)
-            return f"[GPT-OSS Research]\n{response.strip()}"
+            return f"[Model Synthesis]\n{response.strip()}"
         except Exception as e:
-            logger.error(f"GPT-OSS research failed: {e}")
-            return "[GPT-OSS research failed]"
+            logger.error(f"Model synthesis failed: {type(e).__name__}: {e}")
+            return "[Model synthesis failed]"
 
     async def _summarize_research(self, question: MetaculusQuestion, raw_research: str) -> str:
         llm = self.get_llm("summarizer", "llm")
@@ -828,7 +852,7 @@ class Dezzy(ForecastBot):
         # Model-recall pass runs last so it can actually see the retrieved evidence.
         # It used to be handed "" while its own prompt referred to Tavily results.
         # It does not count toward the web-source total; see _search_footprint.
-        recall = await self._run_gptoss_research(question, web_text)
+        recall = await self._run_model_synthesis(question, web_text)
         cleaned = web_cleaned + [recall]
         
         research = (
@@ -1546,7 +1570,9 @@ if __name__ == "__main__":
         )
         targets: List[Tuple[str, str]] = [
             (f"forecaster_{i + 1}", m) for i, m in enumerate(probe.FORECASTER_MODELS)
-        ] + sorted(probe._llm_config_defaults().items())
+        ] + sorted(probe._llm_config_defaults().items()) + [
+            (f"candidate", m) for m in probe.FORECASTER_CANDIDATES
+        ]
 
         async def _ping() -> int:
             failures: List[str] = []
@@ -1565,7 +1591,8 @@ if __name__ == "__main__":
                     seen[model] = role
                 except Exception as e:
                     print(f"  {role:22} {model:46} FAIL  {type(e).__name__}: {str(e)[:180]}")
-                    failures.append(f"{role}={model}")
+                    if role != "candidate":
+                        failures.append(f"{role}={model}")
             if failures:
                 print(f"\nGATE FAIL: {len(failures)} model(s) unreachable: {failures}")
                 return 1
