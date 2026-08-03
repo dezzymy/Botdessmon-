@@ -628,7 +628,11 @@ class Dezzy(ForecastBot):
             response = await loop.run_in_executor(
                 None,
                 lambda: self.asknews.news.search_news(
-                    query=query, n_articles=6, hours_back=24 * 7, strategy="latest news"
+                    query=query, n_articles=6, hours_back=24 * 7, strategy="latest news",
+                    # Defaults to "string", which leaves as_dicts empty and gives us
+                    # no article URLs. Tournament rules require a reasoning comment,
+                    # so citable URLs matter. "both" keeps as_string as a fallback.
+                    return_type="both",
                 ),
             )
             results = []
