@@ -6,7 +6,7 @@ import re
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
@@ -151,6 +151,10 @@ class ExaSearcher:
             "type": "neural",
             "useAutoprompt": True,
             "category": "news",
+            # Without this the API returns title + url only, so every snippet was
+            # empty: the source counted toward research_quality while contributing
+            # nothing but headlines. See https://exa.ai/docs/reference/search
+            "contents": {"text": {"maxCharacters": 1200}},
         }
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -158,11 +162,17 @@ class ExaSearcher:
                 response.raise_for_status()
                 data = response.json()
                 results = []
+                empty_bodies = 0
                 for r in data.get("results", []):
                     title = r.get("title", "No title")
                     url = r.get("url", "")
-                    snippet = (r.get("text", "") or "")[:900]
+                    snippet = (r.get("text") or r.get("summary") or "").strip()[:900]
+                    if not snippet:
+                        empty_bodies += 1
+                        continue
                     results.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
+                if empty_bodies:
+                    logger.warning(f"Exa returned {empty_bodies} result(s) with no text body")
                 return (
                     "[Exa Search Results]\n" + "\n\n".join(results)
                     if results
@@ -172,20 +182,34 @@ class ExaSearcher:
             logger.error(f"Exa search failed: {e}")
             return "[Exa search failed]"
 
-def _fetch_yfinance_data_sync(ticker: str) -> str:
+def _fetch_yfinance_data_sync(ticker: str, as_of: Optional[date] = None) -> str:
+    """Fetch market context for `ticker`, never reading past `as_of`.
+
+    `period="3mo"` and `tk.info` are both relative to the wall clock, so the old
+    version always returned today's prices and today's 52-week range. In a
+    pastcast replay that is future data leaking into a forecast the bot is
+    supposed to be making from an earlier moment. Both are now bounded by
+    `as_of`, and the 52-week range is computed from the fetched window instead
+    of `tk.info`, which has no cutoff parameter at all.
+    """
     if not YFINANCE_AVAILABLE: return ""
     try:
+        cutoff = as_of or datetime.now(timezone.utc).date()
         tk = yf.Ticker(ticker)
-        hist = tk.history(period="3mo")
+        # 52w window so the range below is computable; end is exclusive in yfinance.
+        hist = tk.history(start=cutoff - timedelta(days=372), end=cutoff + timedelta(days=1))
+        if hist.empty: return ""
+        hist = hist[hist.index.date <= cutoff]
         if hist.empty: return ""
         spot = hist['Close'].iloc[-1]
-        high_52 = tk.info.get('fiftyTwoWeekHigh', 'N/A')
-        low_52 = tk.info.get('fiftyTwoWeekLow', 'N/A')
-        vol = hist['Close'].pct_change().dropna().std() * math.sqrt(252)
+        window_52 = hist['Close'].tail(252)
+        high_52 = f"{float(window_52.max()):.2f}"
+        low_52 = f"{float(window_52.min()):.2f}"
+        vol = hist['Close'].tail(63).pct_change().dropna().std() * math.sqrt(252)
         monthly_vol = vol * math.sqrt(21/252)
         rw_p10 = spot * math.exp(-1.28 * monthly_vol)
         rw_p90 = spot * math.exp(1.28 * monthly_vol)
-        return (f"--- LIVE MARKET DATA ({ticker}) ---\n"
+        return (f"--- MARKET DATA ({ticker}) as of {cutoff.isoformat()} ---\n"
                 f"Spot Price: {spot:.2f}\n"
                 f"52-Week Range: {low_52} - {high_52}\n"
                 f"Volatility (Annual): {vol:.2%}\n"
@@ -345,22 +369,32 @@ class Dezzy(ForecastBot):
             if os.getenv("TAVILY_API_KEY") else None
         )
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
+        # Accept either name. The workflows have always exported ASKNEWS_SECRET
+        # while this constructor only read ASKNEWS_CLIENT_SECRET, so self.asknews
+        # was silently None on every CI run and _run_asknews_search could only
+        # ever return "[AskNews not configured]".
+        asknews_id = os.getenv("ASKNEWS_CLIENT_ID")
+        asknews_secret = os.getenv("ASKNEWS_CLIENT_SECRET") or os.getenv("ASKNEWS_SECRET")
         self.asknews = (
-            AskNewsSDK(
-                client_id=os.getenv("ASKNEWS_CLIENT_ID"),
-                client_secret=os.getenv("ASKNEWS_CLIENT_SECRET"),
-            )
-            if os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_CLIENT_SECRET")
+            AskNewsSDK(client_id=asknews_id, client_secret=asknews_secret)
+            if asknews_id and asknews_secret
             else None
         )
 
         self._research_cache: Dict[str, str] = {}
         self._recent_binary_predictions: List[Tuple[str, float]] = []
         self._active_tournament: str = ""
+        self._footprint_counts: Dict[str, int] = {}
+        self._no_evidence_count: int = 0
 
     def set_active_tournament(self, tid: str) -> None:
         self._active_tournament = str(tid).strip().lower()
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
+
+    # Number of optimized queries searched per question. Tavily is billed per
+    # search and is NOT covered by the tournament inference credits, so this is
+    # the main recurring cost knob in the research stack.
+    MAX_SEARCH_QUERIES = 3
 
     @staticmethod
     def default_tournament_ids() -> List[str]:
@@ -384,30 +418,109 @@ class Dezzy(ForecastBot):
     # Research & YFinance
     # ──────────────────────────────────────────────────────────────────────────
 
+    # Tags that represent actual retrieved web evidence. Model-recall steps are
+    # deliberately NOT in here: _run_gptoss_research and _run_mimo_research ask a
+    # model to answer from its own weights, which is not a source. Counting them
+    # as one used to inflate _research_quality_weight to the "two sources" value
+    # on a run that had made a single Tavily call.
+    _WEB_SOURCE_TAGS = {
+        "tavily": "[Tavily Data]",
+        "exa": "[Exa Search Results]",
+        "asknews": "[AskNews Results]",
+    }
+    _MODEL_RECALL_TAGS = {
+        "gptoss": "[GPT-OSS Research]",
+        "mimo": "[MiMo Research]",
+    }
+
     def _search_footprint(self, research: str) -> str:
-        used: List[str] = []
-        def ok(tag: str, fail_markers: List[str]) -> bool:
-            return (tag in research) and (not any(m in research for m in fail_markers))
-        if ok("[Tavily Data]", ["[Tavily not configured]", "[Tavily search failed]"]):
-            used.append("tavily")
-        if ok("[Exa Search Results]", ["[Exa not configured]", "[Exa search failed]"]):
-            used.append("exa")
-        if ok("[AskNews Results]", ["[AskNews not configured]", "[AskNews search failed]"]):
-            used.append("asknews")
-        if ok("[MiMo Research]", ["[MiMo research failed]"]):
-            used.append("mimo")
-        if ok("[GPT-OSS Research]", ["[GPT-OSS research failed]"]):
-            used.append("gptoss")
+        """Distinct web sources that returned evidence, comma separated, or "none".
+
+        A source counts when its success tag is present. The previous version
+        disqualified a source if any failure marker for it appeared anywhere in
+        the text, which silently dropped Tavily entirely as soon as one of
+        several Tavily queries failed.
+        """
+        research = research or ""
+        used = [name for name, tag in self._WEB_SOURCE_TAGS.items() if tag in research]
         return ",".join(used) if used else "none"
 
-    def _ensure_some_research_or_raise(self, research: str) -> None:
-        if self._search_footprint(research) == "none":
-            raise RuntimeError("No research evidence available (Tavily research failed or not configured).")
+    def _model_recall_footprint(self, research: str) -> str:
+        research = research or ""
+        used = [name for name, tag in self._MODEL_RECALL_TAGS.items() if tag in research]
+        return ",".join(used) if used else "none"
+
+    # A forecast made with zero retrieved web evidence is shrunk at least this far
+    # toward the reference class (0.5 for binary, uniform for multiple choice) and
+    # is never extremized.
+    NO_EVIDENCE_SHRINK = 0.45
+    # Numeric equivalent: scale deviations from the median outward by this factor.
+    NO_EVIDENCE_WIDEN = 1.60
+
+    def _note_research_footprint(self, research: str) -> str:
+        """Return the web-source footprint. Never raises.
+
+        Was `_ensure_some_research_or_raise`, which raised when the footprint was
+        "none". That abstained on the question. Tournament leaderboards sum peer
+        scores, so an abstention contributes exactly 0 by construction, and in a
+        spot-scored round coverage is all-or-nothing. Decision (2026-08-03): keep
+        the forecast, shrink it hard toward the reference class, never extremize
+        it, and tag it so it can be filtered out or evaluated later.
+        """
+        return self._search_footprint(research)
+
+    def _trace_research_footprint(self, trace: "ReasoningTrace", research: str) -> Tuple[str, bool]:
+        """Record the footprint on the published rationale and in the run tally.
+
+        The trace line is a stable `key=value` block, semicolon separated, so it
+        is a filterable field rather than prose to grep. Keys are not reordered
+        or renamed without a note here.
+        """
+        web = self._note_research_footprint(research)
+        recall = self._model_recall_footprint(research)
+        quality = self._research_quality_weight(research)
+        no_evidence = (web == "none")
+        n_web = 0 if no_evidence else len(web.split(","))
+
+        self._footprint_counts[web] = self._footprint_counts.get(web, 0) + 1
+        if no_evidence:
+            self._no_evidence_count += 1
+
+        trace.add(
+            "Research footprint",
+            f"research_footprint={web}; web_sources={n_web}; model_recall={recall}; "
+            f"research_quality={quality:.2f}; no_evidence={'true' if no_evidence else 'false'}",
+        )
+        if no_evidence:
+            trace.add(
+                "Research footprint",
+                "No web evidence retrieved. Forecasting anyway rather than abstaining "
+                "(an abstention scores 0), with shrink floored at "
+                f"{self.NO_EVIDENCE_SHRINK:.2f} and extremize disabled.",
+            )
+        return web, no_evidence
+
+    def research_footprint_summary(self) -> str:
+        total = sum(self._footprint_counts.values())
+        if not total:
+            return "no_forecasts=0"
+        parts = " | ".join(f"{k}={v}" for k, v in sorted(self._footprint_counts.items()))
+        pct = 100.0 * self._no_evidence_count / total
+        return (f"forecasts={total}; no_evidence={self._no_evidence_count} ({pct:.0f}%); "
+                f"by_footprint[{parts}]")
+
+    # Research quality by number of distinct web sources that returned evidence.
+    # The previous mapping was {1: 0.65, 2: 0.82}.get(n, 0.7), which is NOT
+    # monotone: three sources scored 0.7, BELOW two sources at 0.82. Wiring Exa
+    # and AskNews in without fixing this would have made better research report
+    # as lower quality, producing heavier shrink and less extremizing.
+    _QUALITY_BY_WEB_SOURCES = {0: 0.25, 1: 0.60, 2: 0.78, 3: 0.88}
+    _QUALITY_MAX = 0.92
 
     def _research_quality_weight(self, research: str) -> float:
         srcs = self._search_footprint(research)
-        if srcs == "none": return 0.25
-        return {1: 0.65, 2: 0.82}.get(len(srcs.split(",")), 0.7)
+        n = 0 if srcs == "none" else len(srcs.split(","))
+        return self._QUALITY_BY_WEB_SOURCES.get(n, self._QUALITY_MAX)
 
     def _grounding_instructions(self) -> str:
         return (
@@ -492,20 +605,57 @@ class Dezzy(ForecastBot):
         if not self.exa_searcher: return "[Exa not configured]"
         return await self.exa_searcher.search(query, num_results=6)
 
+    @staticmethod
+    def _asknews_articles(response: Any) -> List[Any]:
+        """asknews_sdk returns SearchResponse(as_dicts=[...], as_string=str).
+
+        The old code read `response.articles`, which does not exist on any
+        version of the SDK, so every AskNews call raised
+        AttributeError and was swallowed into "[AskNews search failed]".
+        Checked against asknews_sdk.dto.news.SearchResponse. `articles` is
+        tolerated first in case a future version adds it.
+        """
+        for attr in ("articles", "as_dicts"):
+            items = getattr(response, attr, None)
+            if items:
+                return list(items)
+        return []
+
     async def _run_asknews_search(self, query: str) -> str:
         if not self.asknews: return "[AskNews not configured]"
         try:
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(None, lambda: self.asknews.news.search_news(query=query, n_articles=6, hours_back=24*7, strategy="latest news"))
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.asknews.news.search_news(
+                    query=query, n_articles=6, hours_back=24 * 7, strategy="latest news",
+                    # Defaults to "string", which leaves as_dicts empty and gives us
+                    # no article URLs. Tournament rules require a reasoning comment,
+                    # so citable URLs matter. "both" keeps as_string as a fallback.
+                    return_type="both",
+                ),
+            )
             results = []
-            for article in response.articles:
-                title = article.title
-                url = article.url
-                snippet = (article.summary or "")[:900]
-                results.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
-            return f"[AskNews Results]\n" + "\n\n".join(results) if results else "[AskNews search failed]"
+            for article in self._asknews_articles(response):
+                # Article fields are article_url / eng_title / summary, not url / title.
+                url = getattr(article, "article_url", None) or getattr(article, "url", "")
+                title = getattr(article, "eng_title", None) or getattr(article, "title", "") or "No title"
+                points = getattr(article, "key_points", None)
+                body = " ".join(str(x) for x in points) if isinstance(points, (list, tuple)) and points \
+                    else (getattr(article, "summary", "") or "")
+                pub = getattr(article, "pub_date", "")
+                results.append(f"Title: {title}\nURL: {url}\nPublished: {pub}\nSnippet: {str(body)[:900]}")
+            if results:
+                return "[AskNews Results]\n" + "\n\n".join(results)
+            # No structured items: fall back to the flattened string form rather
+            # than reporting a failure on a request that actually succeeded.
+            as_string = getattr(response, "as_string", None)
+            if as_string:
+                return f"[AskNews Results]\n{str(as_string)[:6000]}"
+            logger.warning("AskNews returned no articles for query: %s", query[:120])
+            return "[AskNews search failed]"
         except Exception as e:
-            logger.error(f"AskNews search failed: {e}")
+            logger.error(f"AskNews search failed: {type(e).__name__}: {e}")
             return "[AskNews search failed]"
 
     async def _run_mimo_research(self, question: MetaculusQuestion, research: str) -> str:
@@ -566,20 +716,39 @@ class Dezzy(ForecastBot):
                 ticker = ticker.strip().upper()
                 if ticker and ticker != "NONE":
                     loop = asyncio.get_running_loop()
-                    fin_data = await loop.run_in_executor(None, _fetch_yfinance_data_sync, ticker)
+                    as_of = datetime.now(timezone.utc).date()
+                    fin_data = await loop.run_in_executor(None, _fetch_yfinance_data_sync, ticker, as_of)
             except Exception as e:
                 logger.warning(f"Ticker extraction failed: {e}")
 
         decomp = await self._decompose_question(question)
         queries = await self._optimize_search_query(question, decomp)
-        optimized_query = " OR ".join(queries)
+        queries = [q for q in queries if q][: self.MAX_SEARCH_QUERIES] or [question.question_text[:160]]
 
-        results = await asyncio.gather(
-            self._run_tavily_search(optimized_query),
-            self._run_gptoss_research(question, ""),
-            return_exceptions=True
+        # One search per optimized query. Previously the queries were joined with
+        # " OR " into a single Tavily call at max_results=6, so three separately
+        # optimized queries competed for six result slots between them.
+        web_tasks = [self._run_tavily_search(q) for q in queries]
+        web_tasks.append(self._run_exa_search(queries[0]))
+        web_tasks.append(self._run_asknews_search(queries[0]))
+
+        web_results = await asyncio.gather(*web_tasks, return_exceptions=True)
+        web_cleaned = [
+            f"[Search failed: {str(res)}]" if isinstance(res, BaseException) else res
+            for res in web_results
+        ]
+        web_text = "\n".join(web_cleaned).strip()
+        trace_srcs = self._search_footprint(web_text)
+        logger.info(
+            f"[{self.bot_name}] research footprint: web={trace_srcs} "
+            f"(queries={len(queries)}, quality={self._research_quality_weight(web_text):.2f})"
         )
-        cleaned = [f"[Search failed: {str(res)}]" if isinstance(res, Exception) else res for res in results]
+
+        # Model-recall pass runs last so it can actually see the retrieved evidence.
+        # It used to be handed "" while its own prompt referred to Tavily results.
+        # It does not count toward the web-source total; see _search_footprint.
+        recall = await self._run_gptoss_research(question, web_text)
+        cleaned = web_cleaned + [recall]
         
         research = (
             f"{fin_data}"
@@ -587,7 +756,7 @@ class Dezzy(ForecastBot):
             f"{ForecastingPrinciples.get_generic_fermi_prompt()}\n\n"
             f"{chr(10).join(cleaned).strip()}"
         )
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         self._research_cache[cache_key] = research
         return research
 
@@ -703,7 +872,7 @@ class Dezzy(ForecastBot):
         if not self.flags.enable_red_team:
             trace.add("Red-team", "SKIPPED")
             return initial_pred
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         llm = self.get_llm("red_team", "llm")
         try:
             raw = await llm.invoke(clean_indents(f"""
@@ -782,6 +951,37 @@ class Dezzy(ForecastBot):
         return " | ".join(f"P{int(round(float(p.percentile) * 100))}={p.value:.6g}" for p in pcts)
 
     @staticmethod
+    def _clip_to_question_bounds(pcts: List[Percentile], question: NumericQuestion) -> List[Percentile]:
+        """Keep values inside the question's declared bounds. Widening can push a
+        percentile past them; the structured-timeseries path already did this
+        inline, this is the same logic under a name."""
+        hi = question.nominal_upper_bound if getattr(question, "nominal_upper_bound", None) is not None else getattr(question, "upper_bound", None)
+        lo = question.nominal_lower_bound if getattr(question, "nominal_lower_bound", None) is not None else getattr(question, "lower_bound", None)
+        try:
+            lo_f, hi_f = float(lo), float(hi)
+        except (TypeError, ValueError):
+            return pcts
+        if not (np.isfinite(lo_f) and np.isfinite(hi_f) and hi_f > lo_f):
+            return pcts
+        for p in pcts:
+            p.value = float(np.clip(float(p.value), lo_f, hi_f))
+        return Dezzy._enforce_monotone(pcts)
+
+    @staticmethod
+    def _widen_percentiles(pcts: List[Percentile], factor: float) -> List[Percentile]:
+        """Scale deviations from the central value outward. Numeric analogue of
+        shrinking a probability toward 0.5: it keeps the location estimate and
+        widens the uncertainty."""
+        if factor <= 1.0 or not pcts:
+            return pcts
+        center = Dezzy._median_from_40_60(pcts)
+        widened = [
+            Percentile(percentile=float(p.percentile), value=float(center + (float(p.value) - center) * factor))
+            for p in pcts
+        ]
+        return Dezzy._enforce_monotone(widened)
+
+    @staticmethod
     def _p10_p90(pcts: List[Percentile]) -> Tuple[Optional[float], Optional[float]]:
         """Extract P10 and P90 values from a list of Percentile objects."""
         by = {round(float(p.percentile), 3): float(p.value) for p in pcts}
@@ -850,7 +1050,7 @@ class Dezzy(ForecastBot):
     # ──────────────────────────────────────────────────────────────────────────
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace, grounded_context: Optional[str] = None) -> Any:
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         model = "openrouter/openai/o3"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
         context = grounded_context or self._build_grounded_context(question, research, "Premortem unavailable.")
@@ -940,8 +1140,8 @@ class Dezzy(ForecastBot):
     # ──────────────────────────────────────────────────────────────────────────
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        self._ensure_some_research_or_raise(research)
         trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
 
         research_summary = await self._summarize_research(question, research)
         trace.add("Research summary", research_summary)
@@ -966,8 +1166,14 @@ class Dezzy(ForecastBot):
 
         shrink = 0.28 if spread >= 0.20 else (0.22 if quality < 0.70 else 0.12)
         shrink = float(np.clip(shrink + low_conf_shrink, 0.0, 0.60))
+        if no_evidence:
+            shrink = max(shrink, self.NO_EVIDENCE_SHRINK)
         base_p = self._shrink_to_half(run_med, shrink)
-        applied.append(f"shrink(alpha={shrink:.2f})" + (f"+low-conf({low_conf_shrink:.2f})" if low_conf_shrink > 0 else ""))
+        applied.append(
+            f"shrink(alpha={shrink:.2f})"
+            + (f"+low-conf({low_conf_shrink:.2f})" if low_conf_shrink > 0 else "")
+            + ("+no-evidence-floor" if no_evidence else "")
+        )
 
         red_p = await self._red_team_forecast(question, research, base_p, trace)
         combined = 0.6 * base_p + 0.4 * red_p
@@ -977,8 +1183,12 @@ class Dezzy(ForecastBot):
             combined = 0.5 * combined + 0.5 * 0.5
             applied.append("consistency-shrink")
 
-        # Dynamic Extremize
-        if self.flags.enable_extremize:
+        # Dynamic Extremize. Never sharpen a forecast that has no web evidence behind it.
+        if no_evidence:
+            p_ext = combined
+            applied.append("extremize(off: no web evidence)")
+            trace.add("Extremize", "SKIPPED - research_footprint=none, so the forecast is not sharpened.")
+        elif self.flags.enable_extremize:
             if self._extremize_gate(combined):
                 ext_strength = self._extremize_strength(research, probs + [combined], question)
                 p_ext = ForecastingPrinciples.extremize_logit(combined, ext_strength)
@@ -1009,8 +1219,8 @@ class Dezzy(ForecastBot):
         return ReasonedPrediction(prediction_value=final_p, reasoning=trace.render())
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
-        self._ensure_some_research_or_raise(research)
         trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
 
         trace.add("Research summary", await self._summarize_research(question, research))
         premortem = await self._run_premortem_analysis(question, research)
@@ -1038,6 +1248,9 @@ class Dezzy(ForecastBot):
         uniform = 1.0 / max(1, len(opt_names))
         alpha = 0.10 if quality >= 0.75 else 0.18
         alpha = float(np.clip(alpha + low_conf_shrink, 0.0, 0.60))
+        if no_evidence:
+            alpha = max(alpha, self.NO_EVIDENCE_SHRINK)
+            trace.add("No-evidence handling", f"shrink toward uniform floored at alpha={alpha:.2f}; extremize not used on this path.")
         shrunk = {o: (1 - alpha) * med_probs[o] + alpha * uniform for o in opt_names}
 
         total = float(sum(max(0.0, v) for v in shrunk.values()))
@@ -1047,8 +1260,8 @@ class Dezzy(ForecastBot):
         return ReasonedPrediction(prediction_value=safe_model(PredictedOptionList, {"predicted_options": final}), reasoning=trace.render())
 
     async def _run_forecast_on_numeric_generic(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        self._ensure_some_research_or_raise(research)
         trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
 
         trace.add("Research summary", await self._summarize_research(question, research))
         premortem = await self._run_premortem_analysis(question, research)
@@ -1078,6 +1291,13 @@ class Dezzy(ForecastBot):
                 return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render())
 
         agg = self._enforce_monotone(agg)
+        if no_evidence:
+            agg = self._clip_to_question_bounds(self._widen_percentiles(agg, self.NO_EVIDENCE_WIDEN), question)
+            trace.add(
+                "No-evidence handling",
+                f"research_footprint=none; interval widened x{self.NO_EVIDENCE_WIDEN:.2f} about the median "
+                f"-> {self._format_pcts(agg)}",
+            )
 
         # Calculate numeric relative spread for Spring AI Gate
         p10, p90 = self._p10_p90(agg)
@@ -1147,7 +1367,7 @@ class Dezzy(ForecastBot):
         return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render())
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         if not self.flags.enable_numeric_regimes: return await self._run_forecast_on_numeric_generic(question, research)
 
         regime = self._detect_numeric_regime(question, research)
@@ -1176,8 +1396,84 @@ if __name__ == "__main__":
     parser.add_argument("--no-numeric-regimes", action="store_true")
     parser.add_argument("--no-red-team", action="store_true")
     parser.add_argument("--no-consistency", action="store_true")
+    parser.add_argument("--research-check", action="store_true",
+                        help="Execute the web search clients only, print what each returned, and exit nonzero if a configured client returns no evidence. No Metaculus or LLM calls.")
+    parser.add_argument("--research-check-query", type=str,
+                        default="US Federal Reserve interest rate decision September 2026",
+                        help="Query used by --research-check.")
 
     args = parser.parse_args()
+
+    if args.research_check:
+        # Executes the three web search clients directly against whatever creds are
+        # in the environment. No Metaculus call, no LLM call, no forecast. Exits
+        # nonzero if a client that looks configured fails to return evidence, so it
+        # works as a merge gate rather than as something to read and shrug at.
+        probe = Dezzy.__new__(Dezzy)
+        Dezzy.__init__(
+            probe,
+            research_reports_per_question=1, predictions_per_research_report=1,
+            publish_reports_to_metaculus=False, bot_name="research-check",
+        )
+        query = args.research_check_query
+        print(f"\n=== research stack check ===\nquery: {query!r}\n")
+
+        configured = {
+            "tavily":  ("TAVILY_API_KEY", probe.tavily is not None),
+            "exa":     ("EXA_API_KEY", probe.exa_searcher is not None),
+            "asknews": ("ASKNEWS_CLIENT_ID + ASKNEWS_CLIENT_SECRET/ASKNEWS_SECRET", probe.asknews is not None),
+        }
+        for name, (envs, ok) in configured.items():
+            print(f"  client {name:8} configured={str(ok):5}  from {envs}")
+        print()
+
+        async def _probe() -> int:
+            results = await asyncio.gather(
+                probe._run_tavily_search(query),
+                probe._run_exa_search(query),
+                probe._run_asknews_search(query),
+                return_exceptions=True,
+            )
+            names = ["tavily", "exa", "asknews"]
+            blocks, failures = [], []
+            for name, res in zip(names, results):
+                if isinstance(res, BaseException):
+                    print(f"--- {name}: RAISED {type(res).__name__}: {res}")
+                    failures.append(name)
+                    continue
+                text = res or ""
+                blocks.append(text)
+                first = text.splitlines()[0] if text.splitlines() else "(empty)"
+                print(f"--- {name}: {len(text)} bytes | first line: {first}")
+                print("    " + (text[:400].replace(chr(10), chr(10) + "    ")))
+                print()
+                if "not configured" in first:
+                    print(f"    -> {name} NOT CONFIGURED")
+                elif "failed" in first.lower():
+                    print(f"    -> {name} FAILED despite being configured")
+                    failures.append(name)
+
+            combined = "\n".join(blocks)
+            footprint = probe._search_footprint(combined)
+            quality = probe._research_quality_weight(combined)
+            n = 0 if footprint == "none" else len(footprint.split(","))
+            print(f"=== result ===\nresearch_footprint={footprint}; web_sources={n}; "
+                  f"research_quality={quality:.2f}; no_evidence={'true' if n == 0 else 'false'}")
+
+            for name, (_envs, ok) in configured.items():
+                if ok and name in failures:
+                    print(f"GATE FAIL: {name} is configured but returned no evidence.")
+            if failures:
+                print(f"\nGATE FAIL: {len(failures)} configured client(s) did not return evidence: {failures}")
+                return 1
+            if n == 0:
+                print("\nGATE FAIL: no web evidence from any client.")
+                return 1
+            print(f"\nGATE PASS: {n}/3 clients returned evidence.")
+            return 0
+
+        raise SystemExit(asyncio.run(_probe()))
+
     flags = BotFeatureFlags(
         enable_extremize=not args.no_extremize, enable_decomposition=not args.no_decomposition,
         enable_numeric_regimes=not args.no_numeric_regimes, enable_red_team=not args.no_red_team,
@@ -1213,4 +1509,30 @@ if __name__ == "__main__":
         return await bot.forecast_on_tournament("market-pulse-26q2", return_exceptions=True)
 
     reports = asyncio.run(run_all())
-    bot.log_report_summary(reports)
+    # Emitted before log_report_summary because that call re-raises on any captured
+    # exception. A large no_evidence count means the research stack is broken, and
+    # that must be visible in the run log rather than inferred from a leaderboard.
+    logger.info(f"[{args.bot_name}] research footprint summary: {bot.research_footprint_summary()}")
+    forecast_total = sum(bot._footprint_counts.values())
+    if bot._no_evidence_count:
+        logger.warning(
+            f"[{args.bot_name}] {bot._no_evidence_count}/{forecast_total} forecast(s) published with no retrieved web evidence"
+        )
+    # A warning line is only a signal if somebody reads it, and nobody reads a green
+    # run. If most of a run forecast on nothing, the research stack is broken and the
+    # run must go red.
+    no_evidence_majority = forecast_total > 0 and (bot._no_evidence_count * 2 > forecast_total)
+
+    try:
+        bot.log_report_summary(reports)
+    finally:
+        if no_evidence_majority:
+            logger.error(
+                f"[{args.bot_name}] {bot._no_evidence_count} of {forecast_total} forecasts had no web evidence "
+                f"- majority of the run. Treating as a broken research stack."
+            )
+    if no_evidence_majority:
+        raise RuntimeError(
+            f"Research stack degraded: {bot._no_evidence_count}/{forecast_total} forecasts had "
+            f"research_footprint=none. Check TAVILY_API_KEY, EXA_API_KEY and the AskNews credentials."
+        )
