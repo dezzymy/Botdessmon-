@@ -6,7 +6,7 @@ import re
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Literal
@@ -172,20 +172,34 @@ class ExaSearcher:
             logger.error(f"Exa search failed: {e}")
             return "[Exa search failed]"
 
-def _fetch_yfinance_data_sync(ticker: str) -> str:
+def _fetch_yfinance_data_sync(ticker: str, as_of: Optional[date] = None) -> str:
+    """Fetch market context for `ticker`, never reading past `as_of`.
+
+    `period="3mo"` and `tk.info` are both relative to the wall clock, so the old
+    version always returned today's prices and today's 52-week range. In a
+    pastcast replay that is future data leaking into a forecast the bot is
+    supposed to be making from an earlier moment. Both are now bounded by
+    `as_of`, and the 52-week range is computed from the fetched window instead
+    of `tk.info`, which has no cutoff parameter at all.
+    """
     if not YFINANCE_AVAILABLE: return ""
     try:
+        cutoff = as_of or datetime.now(timezone.utc).date()
         tk = yf.Ticker(ticker)
-        hist = tk.history(period="3mo")
+        # 52w window so the range below is computable; end is exclusive in yfinance.
+        hist = tk.history(start=cutoff - timedelta(days=372), end=cutoff + timedelta(days=1))
+        if hist.empty: return ""
+        hist = hist[hist.index.date <= cutoff]
         if hist.empty: return ""
         spot = hist['Close'].iloc[-1]
-        high_52 = tk.info.get('fiftyTwoWeekHigh', 'N/A')
-        low_52 = tk.info.get('fiftyTwoWeekLow', 'N/A')
-        vol = hist['Close'].pct_change().dropna().std() * math.sqrt(252)
+        window_52 = hist['Close'].tail(252)
+        high_52 = f"{float(window_52.max()):.2f}"
+        low_52 = f"{float(window_52.min()):.2f}"
+        vol = hist['Close'].tail(63).pct_change().dropna().std() * math.sqrt(252)
         monthly_vol = vol * math.sqrt(21/252)
         rw_p10 = spot * math.exp(-1.28 * monthly_vol)
         rw_p90 = spot * math.exp(1.28 * monthly_vol)
-        return (f"--- LIVE MARKET DATA ({ticker}) ---\n"
+        return (f"--- MARKET DATA ({ticker}) as of {cutoff.isoformat()} ---\n"
                 f"Spot Price: {spot:.2f}\n"
                 f"52-Week Range: {low_52} - {high_52}\n"
                 f"Volatility (Annual): {vol:.2%}\n"
@@ -362,6 +376,11 @@ class Dezzy(ForecastBot):
         self._active_tournament = str(tid).strip().lower()
         logger.info(f"[{self.bot_name}] Active tournament set to: '{self._active_tournament}'")
 
+    # Number of optimized queries searched per question. Tavily is billed per
+    # search and is NOT covered by the tournament inference credits, so this is
+    # the main recurring cost knob in the research stack.
+    MAX_SEARCH_QUERIES = 3
+
     @staticmethod
     def default_tournament_ids() -> List[str]:
         return ["33022", "market-pulse-26q2"]
@@ -384,30 +403,54 @@ class Dezzy(ForecastBot):
     # Research & YFinance
     # ──────────────────────────────────────────────────────────────────────────
 
+    # Tags that represent actual retrieved web evidence. Model-recall steps are
+    # deliberately NOT in here: _run_gptoss_research and _run_mimo_research ask a
+    # model to answer from its own weights, which is not a source. Counting them
+    # as one used to inflate _research_quality_weight to the "two sources" value
+    # on a run that had made a single Tavily call.
+    _WEB_SOURCE_TAGS = {
+        "tavily": "[Tavily Data]",
+        "exa": "[Exa Search Results]",
+        "asknews": "[AskNews Results]",
+    }
+    _MODEL_RECALL_TAGS = {
+        "gptoss": "[GPT-OSS Research]",
+        "mimo": "[MiMo Research]",
+    }
+
     def _search_footprint(self, research: str) -> str:
-        used: List[str] = []
-        def ok(tag: str, fail_markers: List[str]) -> bool:
-            return (tag in research) and (not any(m in research for m in fail_markers))
-        if ok("[Tavily Data]", ["[Tavily not configured]", "[Tavily search failed]"]):
-            used.append("tavily")
-        if ok("[Exa Search Results]", ["[Exa not configured]", "[Exa search failed]"]):
-            used.append("exa")
-        if ok("[AskNews Results]", ["[AskNews not configured]", "[AskNews search failed]"]):
-            used.append("asknews")
-        if ok("[MiMo Research]", ["[MiMo research failed]"]):
-            used.append("mimo")
-        if ok("[GPT-OSS Research]", ["[GPT-OSS research failed]"]):
-            used.append("gptoss")
+        """Distinct web sources that returned evidence, comma separated, or "none".
+
+        A source counts when its success tag is present. The previous version
+        disqualified a source if any failure marker for it appeared anywhere in
+        the text, which silently dropped Tavily entirely as soon as one of
+        several Tavily queries failed.
+        """
+        research = research or ""
+        used = [name for name, tag in self._WEB_SOURCE_TAGS.items() if tag in research]
+        return ",".join(used) if used else "none"
+
+    def _model_recall_footprint(self, research: str) -> str:
+        research = research or ""
+        used = [name for name, tag in self._MODEL_RECALL_TAGS.items() if tag in research]
         return ",".join(used) if used else "none"
 
     def _ensure_some_research_or_raise(self, research: str) -> None:
         if self._search_footprint(research) == "none":
             raise RuntimeError("No research evidence available (Tavily research failed or not configured).")
 
+    # Research quality by number of distinct web sources that returned evidence.
+    # The previous mapping was {1: 0.65, 2: 0.82}.get(n, 0.7), which is NOT
+    # monotone: three sources scored 0.7, BELOW two sources at 0.82. Wiring Exa
+    # and AskNews in without fixing this would have made better research report
+    # as lower quality, producing heavier shrink and less extremizing.
+    _QUALITY_BY_WEB_SOURCES = {0: 0.25, 1: 0.60, 2: 0.78, 3: 0.88}
+    _QUALITY_MAX = 0.92
+
     def _research_quality_weight(self, research: str) -> float:
         srcs = self._search_footprint(research)
-        if srcs == "none": return 0.25
-        return {1: 0.65, 2: 0.82}.get(len(srcs.split(",")), 0.7)
+        n = 0 if srcs == "none" else len(srcs.split(","))
+        return self._QUALITY_BY_WEB_SOURCES.get(n, self._QUALITY_MAX)
 
     def _grounding_instructions(self) -> str:
         return (
@@ -566,20 +609,39 @@ class Dezzy(ForecastBot):
                 ticker = ticker.strip().upper()
                 if ticker and ticker != "NONE":
                     loop = asyncio.get_running_loop()
-                    fin_data = await loop.run_in_executor(None, _fetch_yfinance_data_sync, ticker)
+                    as_of = datetime.now(timezone.utc).date()
+                    fin_data = await loop.run_in_executor(None, _fetch_yfinance_data_sync, ticker, as_of)
             except Exception as e:
                 logger.warning(f"Ticker extraction failed: {e}")
 
         decomp = await self._decompose_question(question)
         queries = await self._optimize_search_query(question, decomp)
-        optimized_query = " OR ".join(queries)
+        queries = [q for q in queries if q][: self.MAX_SEARCH_QUERIES] or [question.question_text[:160]]
 
-        results = await asyncio.gather(
-            self._run_tavily_search(optimized_query),
-            self._run_gptoss_research(question, ""),
-            return_exceptions=True
+        # One search per optimized query. Previously the queries were joined with
+        # " OR " into a single Tavily call at max_results=6, so three separately
+        # optimized queries competed for six result slots between them.
+        web_tasks = [self._run_tavily_search(q) for q in queries]
+        web_tasks.append(self._run_exa_search(queries[0]))
+        web_tasks.append(self._run_asknews_search(queries[0]))
+
+        web_results = await asyncio.gather(*web_tasks, return_exceptions=True)
+        web_cleaned = [
+            f"[Search failed: {str(res)}]" if isinstance(res, BaseException) else res
+            for res in web_results
+        ]
+        web_text = "\n".join(web_cleaned).strip()
+        trace_srcs = self._search_footprint(web_text)
+        logger.info(
+            f"[{self.bot_name}] research footprint: web={trace_srcs} "
+            f"(queries={len(queries)}, quality={self._research_quality_weight(web_text):.2f})"
         )
-        cleaned = [f"[Search failed: {str(res)}]" if isinstance(res, Exception) else res for res in results]
+
+        # Model-recall pass runs last so it can actually see the retrieved evidence.
+        # It used to be handed "" while its own prompt referred to Tavily results.
+        # It does not count toward the web-source total; see _search_footprint.
+        recall = await self._run_gptoss_research(question, web_text)
+        cleaned = web_cleaned + [recall]
         
         research = (
             f"{fin_data}"
