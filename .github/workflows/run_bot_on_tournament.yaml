@@ -49,3 +49,19 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_CLIENT_SECRET: ${{ secrets.ASKNEWS_CLIENT_SECRET }}
+      # Runs after the forecast so a transient search failure never costs us
+      # coverage, and with if:always() so it still reports when the bot run fails.
+      # Three search calls, no LLM and no Metaculus call. A silent research failure
+      # now publishes a shrunk forecast, so this is the standing alarm for it.
+      - name: Research stack check
+        if: always()
+        run: |
+          poetry run python main.py --research-check
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_CLIENT_SECRET: ${{ secrets.ASKNEWS_CLIENT_SECRET }}
