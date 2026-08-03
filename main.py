@@ -1088,12 +1088,51 @@ class Dezzy(ForecastBot):
 
     @staticmethod
     def _clip_to_date_bounds(pcts: List[Percentile], question: DateQuestion) -> List[Percentile]:
+        """Clip only the sides the question declares CLOSED.
+
+        open_upper_bound=True means the event may occur after upper_bound, and
+        NumericDistribution represents that with cdf[-1] < 1.0. Clipping such a
+        forecast to the bound converts an honest "possibly much later" into a point
+        mass sitting on the bound, which is exactly what happened on
+        https://www.metaculus.com/questions/43324 in run 30796095656: one pass
+        correctly put P90 in 2036 and clipping flattened it onto 2027-05-28.
+        """
         lo, hi = Dezzy._date_bounds_ts(question)
         if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
             return pcts
+        low_clip = lo if not question.open_lower_bound else -np.inf
+        high_clip = hi if not question.open_upper_bound else np.inf
         for p in pcts:
-            p.value = float(np.clip(float(p.value), lo, hi))
+            p.value = float(np.clip(float(p.value), low_clip, high_clip))
         return Dezzy._enforce_monotone(pcts)
+
+    @staticmethod
+    def _min_representable_gap(lo: float, hi: float, cdf_size: int) -> float:
+        """One CDF bucket. A distribution with cdf_size buckets over [lo, hi] cannot
+        represent mass narrower than this, so percentiles closer together than one
+        bucket are not a confident forecast, they are an unrepresentable one."""
+        buckets = max(2, int(cdf_size)) - 1
+        span = float(hi) - float(lo)
+        return (span / buckets) if (np.isfinite(span) and span > 0) else 0.0
+
+    @staticmethod
+    def _enforce_min_spacing(pcts: List[Percentile], min_gap: float) -> List[Percentile]:
+        """Push adjacent percentiles at least min_gap apart, upward from the lowest.
+
+        _enforce_monotone separates ties by 1e-6, which is a sensible epsilon on a
+        unitless numeric axis and meaningless on a timestamp axis where the unit is
+        one second: six percentiles a microsecond apart is a point mass. Models do
+        collapse onto a single date - two of three passes on question 43324 returned
+        P20 through P90 as the identical date.
+        """
+        if min_gap <= 0 or not pcts:
+            return pcts
+        out = sorted(pcts, key=lambda x: float(x.percentile))
+        for i in range(1, len(out)):
+            need = float(out[i - 1].value) + min_gap
+            if float(out[i].value) < need:
+                out[i].value = need
+        return out
 
     @staticmethod
     def _date_bounds_fallback(question: DateQuestion) -> List[Percentile]:
@@ -1190,8 +1229,13 @@ class Dezzy(ForecastBot):
             return pcts
         if not (np.isfinite(lo_f) and np.isfinite(hi_f) and hi_f > lo_f):
             return pcts
+        # Only clip the closed sides. Same defect as the date path: clipping a
+        # forecast to a bound the question declares open destroys the tail mass that
+        # NumericDistribution represents with cdf[-1] < 1.0.
+        low_clip = lo_f if not getattr(question, "open_lower_bound", False) else -np.inf
+        high_clip = hi_f if not getattr(question, "open_upper_bound", False) else np.inf
         for p in pcts:
-            p.value = float(np.clip(float(p.value), lo_f, hi_f))
+            p.value = float(np.clip(float(p.value), low_clip, high_clip))
         return Dezzy._enforce_monotone(pcts)
 
     @staticmethod
@@ -1323,9 +1367,11 @@ class Dezzy(ForecastBot):
                 {self._grounding_instructions()}
                 Question: {question.question_text}
                 Resolution criteria: {question.resolution_criteria or "Not stated"}
-                The answer is a DATE. It must fall between {lo_dt} and {hi_dt}.
-                {"The upper bound is open: the event may occur after " + hi_dt + "." if question.open_upper_bound else "The event cannot occur after " + hi_dt + "."}
-                {"The lower bound is open: the event may already have occurred before " + lo_dt + "." if question.open_lower_bound else "The event cannot occur before " + lo_dt + "."}
+                The answer is a DATE. The question's stated range is {lo_dt} to {hi_dt}.
+                {"The UPPER bound is OPEN: the event may occur later than " + hi_dt + ", and if you believe that is likely you MUST put your upper percentiles beyond it. Do not compress them onto " + hi_dt + "." if question.open_upper_bound else "The event cannot occur after " + hi_dt + "; do not give a date beyond it."}
+                {"The LOWER bound is OPEN: the event may already have occurred before " + lo_dt + "." if question.open_lower_bound else "The event cannot occur before " + lo_dt + "; do not give a date before it."}
+                Your six dates must be strictly increasing and genuinely spread out.
+                Do not repeat the same date across percentiles: if you are unsure, widen.
                 Context:
                 {context}
                 Today is {datetime.now(timezone.utc).strftime("%Y-%m-%d")}.
@@ -1710,6 +1756,17 @@ class Dezzy(ForecastBot):
             agg = self._date_bounds_fallback(question)
         agg = self._enforce_monotone(agg)
         trace.add(f"Aggregated across {len(runs)} run(s)", self._format_date_pcts(agg))
+
+        min_gap = self._min_representable_gap(lo_ts, hi_ts, question.cdf_size)
+        spaced = self._enforce_min_spacing([Percentile(percentile=p.percentile, value=p.value) for p in agg], min_gap)
+        if self._format_date_pcts(spaced) != self._format_date_pcts(agg):
+            trace.add(
+                "Minimum spacing",
+                f"adjacent percentiles were closer than one CDF bucket "
+                f"({min_gap / 86400.0:.1f} days over a {question.cdf_size}-bucket grid); "
+                f"spread to the representable minimum -> {self._format_date_pcts(spaced)}",
+            )
+        agg = spaced
 
         if no_evidence:
             agg = self._clip_to_date_bounds(self._widen_percentiles(agg, self.NO_EVIDENCE_WIDEN), question)
