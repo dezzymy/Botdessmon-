@@ -8,7 +8,12 @@ For each question, Dezzy:
 3. Runs several independent agent passes, then aggregates them with a median-based blend.
 4. Applies a confidence gate, red-team critique, consistency check, time decay, and optional extremization before emitting a final probability.
 
-The current default run targets the main Metaculus tournaments and does not submit forecasts to an extra benchmark tournament.
+The default run targets, as of 2026-08-03:
+- `33022` — Summer 2026 FutureEval Bot Tournament (open until 2026-09-06).
+- `market-pulse-26q3` — Market Pulse Challenge 26Q3 (spot-scored, resolves by 2026-09-30).
+- `minibench` — rolling alias for the currently active MiniBench round.
+
+Tournament IDs are hardcoded in `Dezzy.default_tournament_ids()`; check that each one is still open before a long run.
 
 ## Models involved
 The bot uses a routed OpenRouter setup with specialized roles:

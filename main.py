@@ -364,7 +364,7 @@ class Dezzy(ForecastBot):
 
     @staticmethod
     def default_tournament_ids() -> List[str]:
-        return ["33022", "market-pulse-26q2"]
+        return ["33022", "market-pulse-26q3", "minibench"]
 
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
