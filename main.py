@@ -595,18 +595,66 @@ class Dezzy(ForecastBot):
     # Core Aggregation & Confidence Gate
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _check_spring_ai_confidence(self, trace: ReasoningTrace, spread: float, quality: float):
+    # Confidence gate tuning.
+    # "spread" is NOT the same quantity on every path:
+    #   binary / multiple-choice -> absolute probability spread across runs, bounded 0..1
+    #   numeric                  -> relative interval width (p90-p10)/|median|, unbounded
+    # so only the probability paths may be compared against SPREAD_LIMIT_PROB.
+    SPREAD_LIMIT_PROB = 0.20
+    MAX_LOW_CONFIDENCE_SHRINK = 0.30
+
+    def _spring_ai_confidence_shrink(
+        self,
+        trace: ReasoningTrace,
+        spread: float,
+        quality: float,
+        kind: str = "probability",
+    ) -> float:
+        """Grade confidence WITHOUT aborting the question.
+
+        Returns extra shrink-toward-ignorance alpha in [0, MAX_LOW_CONFIDENCE_SHRINK].
+
+        This used to raise RuntimeError. The raise was captured per question by
+        forecast_on_tournament(..., return_exceptions=True) (main.py:1153), but
+        log_report_summary() re-raises on any captured exception
+        (forecasting_tools/forecast_bots/forecast_bot.py, raise_errors=True by
+        default), so one gated question exited the process with code 1 and marked
+        the whole scheduled run failed.
+        """
         is_spring_ai = self._active_tournament in ["33022", str(MetaculusClient().CURRENT_AI_COMPETITION_ID)]
-        if not is_spring_ai: return
+        if not is_spring_ai:
+            return 0.0
+
+        if kind != "probability":
+            trace.add(
+                "Spring AI Confidence Gate",
+                f"numeric relative width={spread:.4f}, quality={quality:.2f} - recorded only; "
+                f"a relative interval width is not comparable to a probability spread, so it is not gated.",
+            )
+            return 0.0
 
         trace.add("Spring AI Confidence Gate", f"Evaluating... spread={spread:.4f}, quality={quality:.2f}")
-        
-        if spread > 0.20:
-            raise RuntimeError(f"Low Confidence (Spring AI): Model spread too high ({spread:.2f} > 0.20). Skipping.")
+
+        alpha = 0.0
+        reasons: List[str] = []
+        if spread > self.SPREAD_LIMIT_PROB:
+            over = (spread - self.SPREAD_LIMIT_PROB) / self.SPREAD_LIMIT_PROB
+            alpha += 0.15 * over
+            reasons.append(f"spread {spread:.2f} > {self.SPREAD_LIMIT_PROB:.2f}")
         if quality < 0.65:
-            raise RuntimeError(f"Low Confidence (Spring AI): Research quality too low ({quality:.2f} < 0.65). Skipping.")
-            
-        trace.add("Spring AI Confidence Gate", "PASSED. High confidence adjudged.")
+            alpha += 0.15
+            reasons.append(f"research quality {quality:.2f} < 0.65")
+
+        if not reasons:
+            trace.add("Spring AI Confidence Gate", "PASSED. High confidence adjudged.")
+            return 0.0
+
+        alpha = float(np.clip(alpha, 0.0, self.MAX_LOW_CONFIDENCE_SHRINK))
+        trace.add(
+            "Spring AI Confidence Gate",
+            f"LOW CONFIDENCE ({'; '.join(reasons)}). Forecasting anyway with extra shrink alpha={alpha:.2f}.",
+        )
+        return alpha
 
     @staticmethod
     def _median(xs: List[float]) -> float:
@@ -910,15 +958,16 @@ class Dezzy(ForecastBot):
         run_med = self._median(probs)
         spread = float(max(probs) - min(probs)) if len(probs) > 1 else 0.0
         
-        # Spring AI Confidence Gate
-        self._check_spring_ai_confidence(trace, spread, quality)
+        # Spring AI Confidence Gate (grades confidence, never aborts the question)
+        low_conf_shrink = self._spring_ai_confidence_shrink(trace, spread, quality)
 
         trace.add(f"Multi-run aggregation ({len(probs)} runs)", f"individual={[f'{p:.4f}' for p in probs]} | median={run_med:.4f} | spread={spread:.4f}")
         applied: List[str] = []
 
         shrink = 0.28 if spread >= 0.20 else (0.22 if quality < 0.70 else 0.12)
+        shrink = float(np.clip(shrink + low_conf_shrink, 0.0, 0.60))
         base_p = self._shrink_to_half(run_med, shrink)
-        applied.append(f"shrink(alpha={shrink:.2f})")
+        applied.append(f"shrink(alpha={shrink:.2f})" + (f"+low-conf({low_conf_shrink:.2f})" if low_conf_shrink > 0 else ""))
 
         red_p = await self._red_team_forecast(question, research, base_p, trace)
         combined = 0.6 * base_p + 0.4 * red_p
@@ -984,10 +1033,11 @@ class Dezzy(ForecastBot):
         
         # Calculate MC spread for Confidence Gate
         max_spread = max([(max(per_opt[o]) - min(per_opt[o])) for o in opt_names if per_opt[o]] + [0])
-        self._check_spring_ai_confidence(trace, max_spread, quality)
+        low_conf_shrink = self._spring_ai_confidence_shrink(trace, max_spread, quality)
 
         uniform = 1.0 / max(1, len(opt_names))
         alpha = 0.10 if quality >= 0.75 else 0.18
+        alpha = float(np.clip(alpha + low_conf_shrink, 0.0, 0.60))
         shrunk = {o: (1 - alpha) * med_probs[o] + alpha * uniform for o in opt_names}
 
         total = float(sum(max(0.0, v) for v in shrunk.values()))
@@ -1033,7 +1083,7 @@ class Dezzy(ForecastBot):
         p10, p90 = self._p10_p90(agg)
         med = self._median_from_40_60(agg)
         rel_spread = (p90 - p10) / abs(med) if p10 is not None and p90 is not None and med != 0 else 0.0
-        self._check_spring_ai_confidence(trace, rel_spread, quality)
+        self._spring_ai_confidence_shrink(trace, rel_spread, quality, kind="relative_width")
 
         trace.add("★ FINAL PREDICTION", self._format_pcts(agg))
         return ReasonedPrediction(prediction_value=NumericDistribution.from_question(agg, question), reasoning=trace.render())
