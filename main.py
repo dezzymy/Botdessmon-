@@ -1107,32 +1107,43 @@ class Dezzy(ForecastBot):
         return Dezzy._enforce_monotone(pcts)
 
     @staticmethod
-    def _min_representable_gap(lo: float, hi: float, cdf_size: int) -> float:
-        """One CDF bucket. A distribution with cdf_size buckets over [lo, hi] cannot
-        represent mass narrower than this, so percentiles closer together than one
-        bucket are not a confident forecast, they are an unrepresentable one."""
-        buckets = max(2, int(cdf_size)) - 1
-        span = float(hi) - float(lo)
-        return (span / buckets) if (np.isfinite(span) and span > 0) else 0.0
+    def _ensure_cdf_representable(pcts: List[Percentile], lo: float, hi: float,
+                                  open_lower: bool, open_upper: bool) -> List[Percentile]:
+        """Guard the one shape the library cannot build a CDF from.
 
-    @staticmethod
-    def _enforce_min_spacing(pcts: List[Percentile], min_gap: float) -> List[Percentile]:
-        """Push adjacent percentiles at least min_gap apart, upward from the lowest.
+        `NumericDistribution._get_cdf_at` interpolates between anchor points and
+        raises `ValueError: CDF location Input ... cannot be found` when the grid
+        location it needs is not bracketed. The library's own test asserts that:
+        percentiles 1.1-1.9 against bounds [14, 15] with BOTH bounds open is
+        expected to raise (`test_numeric_report.py`, `with pytest.raises`).
 
-        _enforce_monotone separates ties by 1e-6, which is a sensible epsilon on a
-        unitless numeric axis and meaningless on a timestamp axis where the unit is
-        one second: six percentiles a microsecond apart is a point mass. Models do
-        collapse onto a single date - two of three passes on question 43324 returned
-        P20 through P90 as the identical date.
+        `_add_explicit_upper_lower_bound_percentiles` supplies an anchor at a closed
+        bound, so a closed side rescues the interpolation. The dangerous case is
+        every declared percentile outside the window with the anchoring side OPEN.
+        Nudge the nearest percentile just inside so a bracket exists.
+
+        Note what this deliberately does NOT do: it does not spread tied
+        percentiles. A point mass is a supported, tested input -
+        `test_numeric_edge_of_bin_edge_case` declares all six percentiles at the
+        same value with an open upper bound and asserts the mass lands in the
+        bucket that gets scored. Smearing that across buckets would move mass out
+        of the scored bucket.
         """
-        if min_gap <= 0 or not pcts:
+        if not pcts or not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
             return pcts
+        vals = [float(p.value) for p in pcts]
+        if any(lo <= v <= hi for v in vals):
+            return pcts
+        span = hi - lo
+        inset = span * 0.01
         out = sorted(pcts, key=lambda x: float(x.percentile))
-        for i in range(1, len(out)):
-            need = float(out[i - 1].value) + min_gap
-            if float(out[i].value) < need:
-                out[i].value = need
-        return out
+        if all(v > hi for v in vals) and open_upper:
+            out[0].value = hi - inset
+        elif all(v < lo for v in vals) and open_lower:
+            out[-1].value = lo + inset
+        else:
+            return out
+        return Dezzy._enforce_monotone(out)
 
     @staticmethod
     def _date_bounds_fallback(question: DateQuestion) -> List[Percentile]:
@@ -1370,8 +1381,10 @@ class Dezzy(ForecastBot):
                 The answer is a DATE. The question's stated range is {lo_dt} to {hi_dt}.
                 {"The UPPER bound is OPEN: the event may occur later than " + hi_dt + ", and if you believe that is likely you MUST put your upper percentiles beyond it. Do not compress them onto " + hi_dt + "." if question.open_upper_bound else "The event cannot occur after " + hi_dt + "; do not give a date beyond it."}
                 {"The LOWER bound is OPEN: the event may already have occurred before " + lo_dt + "." if question.open_lower_bound else "The event cannot occur before " + lo_dt + "; do not give a date before it."}
-                Your six dates must be strictly increasing and genuinely spread out.
-                Do not repeat the same date across percentiles: if you are unsure, widen.
+                Give non-decreasing dates. Do not artificially pile percentiles onto
+                {hi_dt} just because it is the stated range end - if you believe the event
+                is likely later than that, say so with later dates. If you genuinely
+                believe one specific date, repeating it is acceptable.
                 Context:
                 {context}
                 Today is {datetime.now(timezone.utc).strftime("%Y-%m-%d")}.
@@ -1757,16 +1770,18 @@ class Dezzy(ForecastBot):
         agg = self._enforce_monotone(agg)
         trace.add(f"Aggregated across {len(runs)} run(s)", self._format_date_pcts(agg))
 
-        min_gap = self._min_representable_gap(lo_ts, hi_ts, question.cdf_size)
-        spaced = self._enforce_min_spacing([Percentile(percentile=p.percentile, value=p.value) for p in agg], min_gap)
-        if self._format_date_pcts(spaced) != self._format_date_pcts(agg):
+        guarded = self._ensure_cdf_representable(
+            [Percentile(percentile=p.percentile, value=p.value) for p in agg],
+            lo_ts, hi_ts, question.open_lower_bound, question.open_upper_bound,
+        )
+        if self._format_date_pcts(guarded) != self._format_date_pcts(agg):
             trace.add(
-                "Minimum spacing",
-                f"adjacent percentiles were closer than one CDF bucket "
-                f"({min_gap / 86400.0:.1f} days over a {question.cdf_size}-bucket grid); "
-                f"spread to the representable minimum -> {self._format_date_pcts(spaced)}",
+                "CDF representability guard",
+                f"every percentile fell outside the declared window with that side open, "
+                f"which the library cannot bracket; nearest percentile nudged inside "
+                f"-> {self._format_date_pcts(guarded)}",
             )
-        agg = spaced
+        agg = guarded
 
         if no_evidence:
             agg = self._clip_to_date_bounds(self._widen_percentiles(agg, self.NO_EVIDENCE_WIDEN), question)
