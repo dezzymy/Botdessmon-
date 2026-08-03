@@ -151,6 +151,10 @@ class ExaSearcher:
             "type": "neural",
             "useAutoprompt": True,
             "category": "news",
+            # Without this the API returns title + url only, so every snippet was
+            # empty: the source counted toward research_quality while contributing
+            # nothing but headlines. See https://exa.ai/docs/reference/search
+            "contents": {"text": {"maxCharacters": 1200}},
         }
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -158,11 +162,17 @@ class ExaSearcher:
                 response.raise_for_status()
                 data = response.json()
                 results = []
+                empty_bodies = 0
                 for r in data.get("results", []):
                     title = r.get("title", "No title")
                     url = r.get("url", "")
-                    snippet = (r.get("text", "") or "")[:900]
+                    snippet = (r.get("text") or r.get("summary") or "").strip()[:900]
+                    if not snippet:
+                        empty_bodies += 1
+                        continue
                     results.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
+                if empty_bodies:
+                    logger.warning(f"Exa returned {empty_bodies} result(s) with no text body")
                 return (
                     "[Exa Search Results]\n" + "\n\n".join(results)
                     if results
@@ -595,20 +605,53 @@ class Dezzy(ForecastBot):
         if not self.exa_searcher: return "[Exa not configured]"
         return await self.exa_searcher.search(query, num_results=6)
 
+    @staticmethod
+    def _asknews_articles(response: Any) -> List[Any]:
+        """asknews_sdk returns SearchResponse(as_dicts=[...], as_string=str).
+
+        The old code read `response.articles`, which does not exist on any
+        version of the SDK, so every AskNews call raised
+        AttributeError and was swallowed into "[AskNews search failed]".
+        Checked against asknews_sdk.dto.news.SearchResponse. `articles` is
+        tolerated first in case a future version adds it.
+        """
+        for attr in ("articles", "as_dicts"):
+            items = getattr(response, attr, None)
+            if items:
+                return list(items)
+        return []
+
     async def _run_asknews_search(self, query: str) -> str:
         if not self.asknews: return "[AskNews not configured]"
         try:
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(None, lambda: self.asknews.news.search_news(query=query, n_articles=6, hours_back=24*7, strategy="latest news"))
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.asknews.news.search_news(
+                    query=query, n_articles=6, hours_back=24 * 7, strategy="latest news"
+                ),
+            )
             results = []
-            for article in response.articles:
-                title = article.title
-                url = article.url
-                snippet = (article.summary or "")[:900]
-                results.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
-            return f"[AskNews Results]\n" + "\n\n".join(results) if results else "[AskNews search failed]"
+            for article in self._asknews_articles(response):
+                # Article fields are article_url / eng_title / summary, not url / title.
+                url = getattr(article, "article_url", None) or getattr(article, "url", "")
+                title = getattr(article, "eng_title", None) or getattr(article, "title", "") or "No title"
+                points = getattr(article, "key_points", None)
+                body = " ".join(str(x) for x in points) if isinstance(points, (list, tuple)) and points \
+                    else (getattr(article, "summary", "") or "")
+                pub = getattr(article, "pub_date", "")
+                results.append(f"Title: {title}\nURL: {url}\nPublished: {pub}\nSnippet: {str(body)[:900]}")
+            if results:
+                return "[AskNews Results]\n" + "\n\n".join(results)
+            # No structured items: fall back to the flattened string form rather
+            # than reporting a failure on a request that actually succeeded.
+            as_string = getattr(response, "as_string", None)
+            if as_string:
+                return f"[AskNews Results]\n{str(as_string)[:6000]}"
+            logger.warning("AskNews returned no articles for query: %s", query[:120])
+            return "[AskNews search failed]"
         except Exception as e:
-            logger.error(f"AskNews search failed: {e}")
+            logger.error(f"AskNews search failed: {type(e).__name__}: {e}")
             return "[AskNews search failed]"
 
     async def _run_mimo_research(self, question: MetaculusQuestion, research: str) -> str:
