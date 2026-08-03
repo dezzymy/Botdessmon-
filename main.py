@@ -371,6 +371,8 @@ class Dezzy(ForecastBot):
         self._research_cache: Dict[str, str] = {}
         self._recent_binary_predictions: List[Tuple[str, float]] = []
         self._active_tournament: str = ""
+        self._footprint_counts: Dict[str, int] = {}
+        self._no_evidence_count: int = 0
 
     def set_active_tournament(self, tid: str) -> None:
         self._active_tournament = str(tid).strip().lower()
@@ -435,9 +437,64 @@ class Dezzy(ForecastBot):
         used = [name for name, tag in self._MODEL_RECALL_TAGS.items() if tag in research]
         return ",".join(used) if used else "none"
 
-    def _ensure_some_research_or_raise(self, research: str) -> None:
-        if self._search_footprint(research) == "none":
-            raise RuntimeError("No research evidence available (Tavily research failed or not configured).")
+    # A forecast made with zero retrieved web evidence is shrunk at least this far
+    # toward the reference class (0.5 for binary, uniform for multiple choice) and
+    # is never extremized.
+    NO_EVIDENCE_SHRINK = 0.45
+    # Numeric equivalent: scale deviations from the median outward by this factor.
+    NO_EVIDENCE_WIDEN = 1.60
+
+    def _note_research_footprint(self, research: str) -> str:
+        """Return the web-source footprint. Never raises.
+
+        Was `_ensure_some_research_or_raise`, which raised when the footprint was
+        "none". That abstained on the question. Tournament leaderboards sum peer
+        scores, so an abstention contributes exactly 0 by construction, and in a
+        spot-scored round coverage is all-or-nothing. Decision (2026-08-03): keep
+        the forecast, shrink it hard toward the reference class, never extremize
+        it, and tag it so it can be filtered out or evaluated later.
+        """
+        return self._search_footprint(research)
+
+    def _trace_research_footprint(self, trace: "ReasoningTrace", research: str) -> Tuple[str, bool]:
+        """Record the footprint on the published rationale and in the run tally.
+
+        The trace line is a stable `key=value` block, semicolon separated, so it
+        is a filterable field rather than prose to grep. Keys are not reordered
+        or renamed without a note here.
+        """
+        web = self._note_research_footprint(research)
+        recall = self._model_recall_footprint(research)
+        quality = self._research_quality_weight(research)
+        no_evidence = (web == "none")
+        n_web = 0 if no_evidence else len(web.split(","))
+
+        self._footprint_counts[web] = self._footprint_counts.get(web, 0) + 1
+        if no_evidence:
+            self._no_evidence_count += 1
+
+        trace.add(
+            "Research footprint",
+            f"research_footprint={web}; web_sources={n_web}; model_recall={recall}; "
+            f"research_quality={quality:.2f}; no_evidence={'true' if no_evidence else 'false'}",
+        )
+        if no_evidence:
+            trace.add(
+                "Research footprint",
+                "No web evidence retrieved. Forecasting anyway rather than abstaining "
+                "(an abstention scores 0), with shrink floored at "
+                f"{self.NO_EVIDENCE_SHRINK:.2f} and extremize disabled.",
+            )
+        return web, no_evidence
+
+    def research_footprint_summary(self) -> str:
+        total = sum(self._footprint_counts.values())
+        if not total:
+            return "no_forecasts=0"
+        parts = " | ".join(f"{k}={v}" for k, v in sorted(self._footprint_counts.items()))
+        pct = 100.0 * self._no_evidence_count / total
+        return (f"forecasts={total}; no_evidence={self._no_evidence_count} ({pct:.0f}%); "
+                f"by_footprint[{parts}]")
 
     # Research quality by number of distinct web sources that returned evidence.
     # The previous mapping was {1: 0.65, 2: 0.82}.get(n, 0.7), which is NOT
@@ -649,7 +706,7 @@ class Dezzy(ForecastBot):
             f"{ForecastingPrinciples.get_generic_fermi_prompt()}\n\n"
             f"{chr(10).join(cleaned).strip()}"
         )
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         self._research_cache[cache_key] = research
         return research
 
@@ -765,7 +822,7 @@ class Dezzy(ForecastBot):
         if not self.flags.enable_red_team:
             trace.add("Red-team", "SKIPPED")
             return initial_pred
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         llm = self.get_llm("red_team", "llm")
         try:
             raw = await llm.invoke(clean_indents(f"""
@@ -844,6 +901,37 @@ class Dezzy(ForecastBot):
         return " | ".join(f"P{int(round(float(p.percentile) * 100))}={p.value:.6g}" for p in pcts)
 
     @staticmethod
+    def _clip_to_question_bounds(pcts: List[Percentile], question: NumericQuestion) -> List[Percentile]:
+        """Keep values inside the question's declared bounds. Widening can push a
+        percentile past them; the structured-timeseries path already did this
+        inline, this is the same logic under a name."""
+        hi = question.nominal_upper_bound if getattr(question, "nominal_upper_bound", None) is not None else getattr(question, "upper_bound", None)
+        lo = question.nominal_lower_bound if getattr(question, "nominal_lower_bound", None) is not None else getattr(question, "lower_bound", None)
+        try:
+            lo_f, hi_f = float(lo), float(hi)
+        except (TypeError, ValueError):
+            return pcts
+        if not (np.isfinite(lo_f) and np.isfinite(hi_f) and hi_f > lo_f):
+            return pcts
+        for p in pcts:
+            p.value = float(np.clip(float(p.value), lo_f, hi_f))
+        return Dezzy._enforce_monotone(pcts)
+
+    @staticmethod
+    def _widen_percentiles(pcts: List[Percentile], factor: float) -> List[Percentile]:
+        """Scale deviations from the central value outward. Numeric analogue of
+        shrinking a probability toward 0.5: it keeps the location estimate and
+        widens the uncertainty."""
+        if factor <= 1.0 or not pcts:
+            return pcts
+        center = Dezzy._median_from_40_60(pcts)
+        widened = [
+            Percentile(percentile=float(p.percentile), value=float(center + (float(p.value) - center) * factor))
+            for p in pcts
+        ]
+        return Dezzy._enforce_monotone(widened)
+
+    @staticmethod
     def _p10_p90(pcts: List[Percentile]) -> Tuple[Optional[float], Optional[float]]:
         """Extract P10 and P90 values from a list of Percentile objects."""
         by = {round(float(p.percentile), 3): float(p.value) for p in pcts}
@@ -912,7 +1000,7 @@ class Dezzy(ForecastBot):
     # ──────────────────────────────────────────────────────────────────────────
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace, grounded_context: Optional[str] = None) -> Any:
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         model = "openrouter/openai/o3"
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
         context = grounded_context or self._build_grounded_context(question, research, "Premortem unavailable.")
@@ -1002,8 +1090,8 @@ class Dezzy(ForecastBot):
     # ──────────────────────────────────────────────────────────────────────────
 
     async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
-        self._ensure_some_research_or_raise(research)
         trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
 
         research_summary = await self._summarize_research(question, research)
         trace.add("Research summary", research_summary)
@@ -1028,8 +1116,14 @@ class Dezzy(ForecastBot):
 
         shrink = 0.28 if spread >= 0.20 else (0.22 if quality < 0.70 else 0.12)
         shrink = float(np.clip(shrink + low_conf_shrink, 0.0, 0.60))
+        if no_evidence:
+            shrink = max(shrink, self.NO_EVIDENCE_SHRINK)
         base_p = self._shrink_to_half(run_med, shrink)
-        applied.append(f"shrink(alpha={shrink:.2f})" + (f"+low-conf({low_conf_shrink:.2f})" if low_conf_shrink > 0 else ""))
+        applied.append(
+            f"shrink(alpha={shrink:.2f})"
+            + (f"+low-conf({low_conf_shrink:.2f})" if low_conf_shrink > 0 else "")
+            + ("+no-evidence-floor" if no_evidence else "")
+        )
 
         red_p = await self._red_team_forecast(question, research, base_p, trace)
         combined = 0.6 * base_p + 0.4 * red_p
@@ -1039,8 +1133,12 @@ class Dezzy(ForecastBot):
             combined = 0.5 * combined + 0.5 * 0.5
             applied.append("consistency-shrink")
 
-        # Dynamic Extremize
-        if self.flags.enable_extremize:
+        # Dynamic Extremize. Never sharpen a forecast that has no web evidence behind it.
+        if no_evidence:
+            p_ext = combined
+            applied.append("extremize(off: no web evidence)")
+            trace.add("Extremize", "SKIPPED - research_footprint=none, so the forecast is not sharpened.")
+        elif self.flags.enable_extremize:
             if self._extremize_gate(combined):
                 ext_strength = self._extremize_strength(research, probs + [combined], question)
                 p_ext = ForecastingPrinciples.extremize_logit(combined, ext_strength)
@@ -1071,8 +1169,8 @@ class Dezzy(ForecastBot):
         return ReasonedPrediction(prediction_value=final_p, reasoning=trace.render())
 
     async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
-        self._ensure_some_research_or_raise(research)
         trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
 
         trace.add("Research summary", await self._summarize_research(question, research))
         premortem = await self._run_premortem_analysis(question, research)
@@ -1100,6 +1198,9 @@ class Dezzy(ForecastBot):
         uniform = 1.0 / max(1, len(opt_names))
         alpha = 0.10 if quality >= 0.75 else 0.18
         alpha = float(np.clip(alpha + low_conf_shrink, 0.0, 0.60))
+        if no_evidence:
+            alpha = max(alpha, self.NO_EVIDENCE_SHRINK)
+            trace.add("No-evidence handling", f"shrink toward uniform floored at alpha={alpha:.2f}; extremize not used on this path.")
         shrunk = {o: (1 - alpha) * med_probs[o] + alpha * uniform for o in opt_names}
 
         total = float(sum(max(0.0, v) for v in shrunk.values()))
@@ -1109,8 +1210,8 @@ class Dezzy(ForecastBot):
         return ReasonedPrediction(prediction_value=safe_model(PredictedOptionList, {"predicted_options": final}), reasoning=trace.render())
 
     async def _run_forecast_on_numeric_generic(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        self._ensure_some_research_or_raise(research)
         trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
 
         trace.add("Research summary", await self._summarize_research(question, research))
         premortem = await self._run_premortem_analysis(question, research)
@@ -1140,6 +1241,13 @@ class Dezzy(ForecastBot):
                 return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render())
 
         agg = self._enforce_monotone(agg)
+        if no_evidence:
+            agg = self._clip_to_question_bounds(self._widen_percentiles(agg, self.NO_EVIDENCE_WIDEN), question)
+            trace.add(
+                "No-evidence handling",
+                f"research_footprint=none; interval widened x{self.NO_EVIDENCE_WIDEN:.2f} about the median "
+                f"-> {self._format_pcts(agg)}",
+            )
 
         # Calculate numeric relative spread for Spring AI Gate
         p10, p90 = self._p10_p90(agg)
@@ -1209,7 +1317,7 @@ class Dezzy(ForecastBot):
         return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render())
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        self._ensure_some_research_or_raise(research)
+        self._note_research_footprint(research)
         if not self.flags.enable_numeric_regimes: return await self._run_forecast_on_numeric_generic(question, research)
 
         regime = self._detect_numeric_regime(question, research)
@@ -1275,4 +1383,12 @@ if __name__ == "__main__":
         return await bot.forecast_on_tournament("market-pulse-26q2", return_exceptions=True)
 
     reports = asyncio.run(run_all())
+    # Emitted before log_report_summary because that call re-raises on any captured
+    # exception. A large no_evidence count means the research stack is broken, and
+    # that must be visible in the run log rather than inferred from a leaderboard.
+    logger.info(f"[{args.bot_name}] research footprint summary: {bot.research_footprint_summary()}")
+    if bot._no_evidence_count:
+        logger.warning(
+            f"[{args.bot_name}] {bot._no_evidence_count} forecast(s) published with no retrieved web evidence"
+        )
     bot.log_report_summary(reports)
