@@ -28,6 +28,7 @@ from asknews_sdk import AskNewsSDK
 
 from forecasting_tools import (
     BinaryQuestion,
+    DateQuestion,
     ForecastBot,
     GeneralLlm,
     MetaculusClient,
@@ -1075,6 +1076,107 @@ class Dezzy(ForecastBot):
     def _format_pcts(pcts: List[Percentile]) -> str:
         return " | ".join(f"P{int(round(float(p.percentile) * 100))}={p.value:.6g}" for p in pcts)
 
+    # Percentiles the pipeline always works in.
+    STANDARD_PERCENTILES: List[float] = [0.1, 0.2, 0.4, 0.6, 0.8, 0.9]
+
+    @staticmethod
+    def _date_bounds_ts(question: DateQuestion) -> Tuple[float, float]:
+        """DateQuestion bounds are datetimes. NumericDistribution.from_question
+        converts them with .timestamp() and sets is_date=True, so every percentile
+        value on this path must be a POSIX timestamp."""
+        return float(question.lower_bound.timestamp()), float(question.upper_bound.timestamp())
+
+    @staticmethod
+    def _clip_to_date_bounds(pcts: List[Percentile], question: DateQuestion) -> List[Percentile]:
+        lo, hi = Dezzy._date_bounds_ts(question)
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+            return pcts
+        for p in pcts:
+            p.value = float(np.clip(float(p.value), lo, hi))
+        return Dezzy._enforce_monotone(pcts)
+
+    @staticmethod
+    def _date_bounds_fallback(question: DateQuestion) -> List[Percentile]:
+        lo, hi = Dezzy._date_bounds_ts(question)
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+            now = datetime.now(timezone.utc).timestamp()
+            lo, hi = now, now + 365 * 86400.0
+        w = {0.1: 0.05, 0.2: 0.15, 0.4: 0.40, 0.6: 0.60, 0.8: 0.85, 0.9: 0.95}
+        return Dezzy._enforce_monotone(
+            [Percentile(percentile=q, value=lo + (hi - lo) * w[q]) for q in Dezzy.STANDARD_PERCENTILES]
+        )
+
+    _DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y")
+
+    @staticmethod
+    def _parse_one_date(text: str) -> Optional[float]:
+        """Parse a single date to a POSIX timestamp, or None."""
+        raw = (text or "").strip().strip(".,;")
+        if not raw:
+            return None
+        m = re.search(r"\d{4}-\d{2}-\d{2}", raw)
+        candidates = [m.group(0)] if m else []
+        candidates.append(raw)
+        for cand in candidates:
+            for fmt in Dezzy._DATE_FORMATS:
+                try:
+                    return datetime.strptime(cand, fmt).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _format_date_pcts(pcts: List[Percentile]) -> str:
+        out = []
+        for p in sorted(pcts, key=lambda x: float(x.percentile)):
+            try:
+                shown = datetime.fromtimestamp(float(p.value), tz=timezone.utc).strftime("%Y-%m-%d")
+            except (OverflowError, OSError, ValueError):
+                shown = f"{float(p.value):.0f}"
+            out.append(f"P{int(round(float(p.percentile) * 100))}={shown}")
+        return " | ".join(out)
+
+    async def _parse_date_percentiles(self, question: DateQuestion, text: str, stage: str) -> List[Percentile]:
+        """Pull six `Percentile NN: <date>` lines out of the model output.
+
+        Deliberately regex-first rather than going straight to the parser LLM: the
+        expected shape is fixed, and a local parse is cheaper and cannot hallucinate
+        a date the forecaster did not write.
+        """
+        def scan(src: str) -> List[Percentile]:
+            found: Dict[float, float] = {}
+            for line in (src or "").splitlines():
+                m = re.match(r"^\s*Percentile\s*(10|20|40|60|80|90)\s*:\s*(.+?)\s*$", line, re.IGNORECASE)
+                if not m:
+                    continue
+                ts = self._parse_one_date(m.group(2))
+                if ts is not None:
+                    found[round(int(m.group(1)) / 100.0, 3)] = ts
+            if all(round(q, 3) in found for q in self.STANDARD_PERCENTILES):
+                return self._enforce_monotone(
+                    [Percentile(percentile=q, value=found[round(q, 3)]) for q in self.STANDARD_PERCENTILES]
+                )
+            return []
+
+        got = scan(text) or scan(self._extract_percentile_block(text) or "")
+        if got:
+            return got
+        try:
+            parser_llm = self.get_llm("parser", "llm")
+            reformatted = await parser_llm.invoke(
+                "Rewrite the following into EXACTLY these 6 lines and nothing else, each date as YYYY-MM-DD:\n"
+                "Percentile 10: YYYY-MM-DD\nPercentile 20: YYYY-MM-DD\nPercentile 40: YYYY-MM-DD\n"
+                "Percentile 60: YYYY-MM-DD\nPercentile 80: YYYY-MM-DD\nPercentile 90: YYYY-MM-DD\n\n"
+                f"Text:\n{text}"
+            )
+            got = scan(reformatted)
+            if got:
+                return got
+        except Exception as e:
+            logger.warning(f"date percentile reformat failed at {stage}: {type(e).__name__}: {e}")
+        logger.warning(f"date percentile parse failed at {stage}; using bounds fallback")
+        return self._date_bounds_fallback(question)
+
     @staticmethod
     def _clip_to_question_bounds(pcts: List[Percentile], question: NumericQuestion) -> List[Percentile]:
         """Keep values inside the question's declared bounds. Widening can push a
@@ -1212,6 +1314,39 @@ class Dezzy(ForecastBot):
             """))
             trace.add_narrative(run_index, "\n".join(line for line in (raw or "").splitlines() if not line.strip().startswith("{")).strip())
             return await structure_output(sanitize_llm_json(raw), PredictedOptionList, model=self.get_llm("parser", "llm"), num_validation_samples=1)
+
+        if isinstance(question, DateQuestion):
+            lo_dt = question.lower_bound.strftime("%Y-%m-%d")
+            hi_dt = question.upper_bound.strftime("%Y-%m-%d")
+            raw = await llm.invoke(clean_indents(f"""
+                You are a calibrated superforecaster estimating WHEN an event occurs.
+                {self._grounding_instructions()}
+                Question: {question.question_text}
+                Resolution criteria: {question.resolution_criteria or "Not stated"}
+                The answer is a DATE. It must fall between {lo_dt} and {hi_dt}.
+                {"The upper bound is open: the event may occur after " + hi_dt + "." if question.open_upper_bound else "The event cannot occur after " + hi_dt + "."}
+                {"The lower bound is open: the event may already have occurred before " + lo_dt + "." if question.open_lower_bound else "The event cannot occur before " + lo_dt + "."}
+                Context:
+                {context}
+                Today is {datetime.now(timezone.utc).strftime("%Y-%m-%d")}.
+                Reason about the mechanism and timing first: what has to happen, how long each
+                step historically takes, and what would delay it. Keep the interval wide unless
+                the evidence is strong; late resolution is more common than early.
+                The LAST thing you write is EXACTLY these 6 lines, each date as YYYY-MM-DD,
+                in increasing order:
+                Percentile 10: YYYY-MM-DD
+                Percentile 20: YYYY-MM-DD
+                Percentile 40: YYYY-MM-DD
+                Percentile 60: YYYY-MM-DD
+                Percentile 80: YYYY-MM-DD
+                Percentile 90: YYYY-MM-DD
+            """))
+            narrative_lines = []
+            for line in (raw or "").splitlines():
+                if re.match(r"^\s*Percentile\s*(10|20|40|60|80|90)\s*:", line, re.IGNORECASE): break
+                narrative_lines.append(line)
+            trace.add_narrative(run_index, "\n".join(narrative_lines).strip())
+            return await self._parse_date_percentiles(question, raw, stage=f"run{run_index}")
 
         if isinstance(question, NumericQuestion):
             upper = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
@@ -1517,6 +1652,93 @@ class Dezzy(ForecastBot):
         pcts = self._enforce_monotone(pcts)
         trace.add("★ FINAL PREDICTION", self._format_pcts(pcts))
         return ReasonedPrediction(prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render())
+
+    async def _run_forecast_on_date(self, question: DateQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
+        """Forecast a date question as a distribution of POSIX timestamps.
+
+        The library dispatches DateQuestion here (forecast_bot.py:511) and expects
+        a NumericDistribution of timestamps. Dezzy never implemented it, so every
+        date question raised NotImplementedError. After the confidence-gate change
+        that failure no longer stops the run, which made it a silent loss of one
+        forecast per date question.
+
+        Deliberately NOT reusing the numeric regime detection: PARTIAL_REVEAL_SUM
+        and STRUCTURED_TS both key off numeric magnitudes and a bounded multiplier,
+        neither of which means anything on a timestamp axis.
+        """
+        trace = ReasoningTrace(question.question_text, self.bot_name)
+        _web, no_evidence = self._trace_research_footprint(trace, research)
+        quality = self._research_quality_weight(research)
+
+        lo_ts, hi_ts = self._date_bounds_ts(question)
+        trace.add(
+            "Question bounds",
+            f"{question.lower_bound.strftime('%Y-%m-%d')} to {question.upper_bound.strftime('%Y-%m-%d')} "
+            f"| open_lower={question.open_lower_bound} open_upper={question.open_upper_bound}",
+        )
+
+        premortem = await self._run_premortem_analysis(question, research)
+        trace.add("Premortem", premortem[:1200])
+        grounded_context = self._build_grounded_context(question, research, premortem)
+
+        runs = await self._multi_run(question, research, trace, grounded_context=grounded_context)
+        runs = [r for r in runs if r]
+        if not runs:
+            pcts = self._date_bounds_fallback(question)
+            trace.add("Fallback prediction", "All independent date runs failed; returning a wide in-bounds distribution.")
+            trace.add("★ FINAL PREDICTION", self._format_date_pcts(pcts))
+            return ReasonedPrediction(
+                prediction_value=NumericDistribution.from_question(pcts, question), reasoning=trace.render()
+            )
+
+        for i, r in enumerate(runs, 1):
+            trace.add(f"Run {i} percentiles", self._format_date_pcts(r))
+
+        # Median per percentile across runs.
+        by_q: Dict[float, List[float]] = {round(q, 3): [] for q in self.STANDARD_PERCENTILES}
+        for r in runs:
+            for pc in r:
+                key = round(float(pc.percentile), 3)
+                if key in by_q:
+                    by_q[key].append(float(pc.value))
+        agg = [
+            Percentile(percentile=q, value=float(np.median(by_q[round(q, 3)])))
+            for q in self.STANDARD_PERCENTILES
+            if by_q[round(q, 3)]
+        ]
+        if len(agg) < len(self.STANDARD_PERCENTILES):
+            agg = self._date_bounds_fallback(question)
+        agg = self._enforce_monotone(agg)
+        trace.add(f"Aggregated across {len(runs)} run(s)", self._format_date_pcts(agg))
+
+        if no_evidence:
+            agg = self._clip_to_date_bounds(self._widen_percentiles(agg, self.NO_EVIDENCE_WIDEN), question)
+            trace.add(
+                "No-evidence handling",
+                f"research_footprint=none; interval widened x{self.NO_EVIDENCE_WIDEN:.2f} about the median "
+                f"-> {self._format_date_pcts(agg)}",
+            )
+
+        # Spread is RECORDED, never gated, on this path. The P10-P90 span of a date
+        # distribution is a duration in seconds; it is not a probability spread and
+        # not the numeric relative width either, so no threshold from either regime
+        # transfers to it. See SpreadScale.
+        p10, p90 = self._p10_p90(agg)
+        span_days = ((p90 - p10) / 86400.0) if (p10 is not None and p90 is not None) else 0.0
+        bounds_days = ((hi_ts - lo_ts) / 86400.0) if np.isfinite(hi_ts - lo_ts) else 0.0
+        frac = (span_days / bounds_days) if bounds_days > 0 else 0.0
+        trace.add(
+            "Spread (recorded, not gated)",
+            f"P10-P90 span={span_days:.1f} days over a {bounds_days:.1f} day window "
+            f"({frac:.1%} of the range); quality={quality:.2f}. A date span is a duration, "
+            f"not a probability spread, so it is recorded only.",
+        )
+
+        agg = self._clip_to_date_bounds(agg, question)
+        trace.add("★ FINAL PREDICTION", self._format_date_pcts(agg))
+        return ReasonedPrediction(
+            prediction_value=NumericDistribution.from_question(agg, question), reasoning=trace.render()
+        )
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
         self._note_research_footprint(research)
