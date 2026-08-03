@@ -359,12 +359,15 @@ class Dezzy(ForecastBot):
             if os.getenv("TAVILY_API_KEY") else None
         )
         self.exa_searcher = ExaSearcher() if os.getenv("EXA_API_KEY") else None
+        # Accept either name. The workflows have always exported ASKNEWS_SECRET
+        # while this constructor only read ASKNEWS_CLIENT_SECRET, so self.asknews
+        # was silently None on every CI run and _run_asknews_search could only
+        # ever return "[AskNews not configured]".
+        asknews_id = os.getenv("ASKNEWS_CLIENT_ID")
+        asknews_secret = os.getenv("ASKNEWS_CLIENT_SECRET") or os.getenv("ASKNEWS_SECRET")
         self.asknews = (
-            AskNewsSDK(
-                client_id=os.getenv("ASKNEWS_CLIENT_ID"),
-                client_secret=os.getenv("ASKNEWS_CLIENT_SECRET"),
-            )
-            if os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_CLIENT_SECRET")
+            AskNewsSDK(client_id=asknews_id, client_secret=asknews_secret)
+            if asknews_id and asknews_secret
             else None
         )
 
@@ -1346,8 +1349,84 @@ if __name__ == "__main__":
     parser.add_argument("--no-numeric-regimes", action="store_true")
     parser.add_argument("--no-red-team", action="store_true")
     parser.add_argument("--no-consistency", action="store_true")
+    parser.add_argument("--research-check", action="store_true",
+                        help="Execute the web search clients only, print what each returned, and exit nonzero if a configured client returns no evidence. No Metaculus or LLM calls.")
+    parser.add_argument("--research-check-query", type=str,
+                        default="US Federal Reserve interest rate decision September 2026",
+                        help="Query used by --research-check.")
 
     args = parser.parse_args()
+
+    if args.research_check:
+        # Executes the three web search clients directly against whatever creds are
+        # in the environment. No Metaculus call, no LLM call, no forecast. Exits
+        # nonzero if a client that looks configured fails to return evidence, so it
+        # works as a merge gate rather than as something to read and shrug at.
+        probe = Dezzy.__new__(Dezzy)
+        Dezzy.__init__(
+            probe,
+            research_reports_per_question=1, predictions_per_research_report=1,
+            publish_reports_to_metaculus=False, bot_name="research-check",
+        )
+        query = args.research_check_query
+        print(f"\n=== research stack check ===\nquery: {query!r}\n")
+
+        configured = {
+            "tavily":  ("TAVILY_API_KEY", probe.tavily is not None),
+            "exa":     ("EXA_API_KEY", probe.exa_searcher is not None),
+            "asknews": ("ASKNEWS_CLIENT_ID + ASKNEWS_CLIENT_SECRET/ASKNEWS_SECRET", probe.asknews is not None),
+        }
+        for name, (envs, ok) in configured.items():
+            print(f"  client {name:8} configured={str(ok):5}  from {envs}")
+        print()
+
+        async def _probe() -> int:
+            results = await asyncio.gather(
+                probe._run_tavily_search(query),
+                probe._run_exa_search(query),
+                probe._run_asknews_search(query),
+                return_exceptions=True,
+            )
+            names = ["tavily", "exa", "asknews"]
+            blocks, failures = [], []
+            for name, res in zip(names, results):
+                if isinstance(res, BaseException):
+                    print(f"--- {name}: RAISED {type(res).__name__}: {res}")
+                    failures.append(name)
+                    continue
+                text = res or ""
+                blocks.append(text)
+                first = text.splitlines()[0] if text.splitlines() else "(empty)"
+                print(f"--- {name}: {len(text)} bytes | first line: {first}")
+                print("    " + (text[:400].replace(chr(10), chr(10) + "    ")))
+                print()
+                if "not configured" in first:
+                    print(f"    -> {name} NOT CONFIGURED")
+                elif "failed" in first.lower():
+                    print(f"    -> {name} FAILED despite being configured")
+                    failures.append(name)
+
+            combined = "\n".join(blocks)
+            footprint = probe._search_footprint(combined)
+            quality = probe._research_quality_weight(combined)
+            n = 0 if footprint == "none" else len(footprint.split(","))
+            print(f"=== result ===\nresearch_footprint={footprint}; web_sources={n}; "
+                  f"research_quality={quality:.2f}; no_evidence={'true' if n == 0 else 'false'}")
+
+            for name, (_envs, ok) in configured.items():
+                if ok and name in failures:
+                    print(f"GATE FAIL: {name} is configured but returned no evidence.")
+            if failures:
+                print(f"\nGATE FAIL: {len(failures)} configured client(s) did not return evidence: {failures}")
+                return 1
+            if n == 0:
+                print("\nGATE FAIL: no web evidence from any client.")
+                return 1
+            print(f"\nGATE PASS: {n}/3 clients returned evidence.")
+            return 0
+
+        raise SystemExit(asyncio.run(_probe()))
+
     flags = BotFeatureFlags(
         enable_extremize=not args.no_extremize, enable_decomposition=not args.no_decomposition,
         enable_numeric_regimes=not args.no_numeric_regimes, enable_red_team=not args.no_red_team,
@@ -1387,8 +1466,26 @@ if __name__ == "__main__":
     # exception. A large no_evidence count means the research stack is broken, and
     # that must be visible in the run log rather than inferred from a leaderboard.
     logger.info(f"[{args.bot_name}] research footprint summary: {bot.research_footprint_summary()}")
+    forecast_total = sum(bot._footprint_counts.values())
     if bot._no_evidence_count:
         logger.warning(
-            f"[{args.bot_name}] {bot._no_evidence_count} forecast(s) published with no retrieved web evidence"
+            f"[{args.bot_name}] {bot._no_evidence_count}/{forecast_total} forecast(s) published with no retrieved web evidence"
         )
-    bot.log_report_summary(reports)
+    # A warning line is only a signal if somebody reads it, and nobody reads a green
+    # run. If most of a run forecast on nothing, the research stack is broken and the
+    # run must go red.
+    no_evidence_majority = forecast_total > 0 and (bot._no_evidence_count * 2 > forecast_total)
+
+    try:
+        bot.log_report_summary(reports)
+    finally:
+        if no_evidence_majority:
+            logger.error(
+                f"[{args.bot_name}] {bot._no_evidence_count} of {forecast_total} forecasts had no web evidence "
+                f"- majority of the run. Treating as a broken research stack."
+            )
+    if no_evidence_majority:
+        raise RuntimeError(
+            f"Research stack degraded: {bot._no_evidence_count}/{forecast_total} forecasts had "
+            f"research_footprint=none. Check TAVILY_API_KEY, EXA_API_KEY and the AskNews credentials."
+        )
