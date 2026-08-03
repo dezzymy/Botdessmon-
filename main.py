@@ -295,6 +295,60 @@ class ReferenceClassExtract(BaseModel):
 class BoundedMultiplier(BaseModel):
     multiplier: float
 
+@dataclass(frozen=True)
+class SpreadScale:
+    """Every threshold keyed to run-to-run spread, plus the regime it was set in.
+
+    `spread` means different things depending on how the forecast passes are
+    configured. With all passes on one model at temperature 0.1-0.2 it is
+    within-model sampling variance. With passes on different models it is
+    between-model disagreement, a structurally larger quantity. A bare 0.20 in
+    the code cannot tell you which it was calibrated against, so it silently
+    outlives its regime. This carries the regime with the numbers.
+    """
+    regime: str
+    gate_armed: bool
+    gate_limit: Optional[float]
+    heavy_shrink_at: Optional[float]
+    agreement_full_disagreement_at: Optional[float]
+    extremize_max: float
+    # Agreement value used when spread cannot be interpreted. 1.0 keeps extremize
+    # driven by research quality alone (which is calibrated independently of
+    # spread) under the lower extremize_max ceiling. Set to 0.0 to turn extremize
+    # off entirely while uncalibrated. This is the one judgement call in the
+    # cross-model preset rather than a disarm; both options are one edit.
+    agreement_when_uncalibrated: float = 1.0
+
+    @property
+    def spread_is_calibrated(self) -> bool:
+        return self.gate_limit is not None
+
+# Calibrated against o3-only passes at temperature 0.10-0.20. These are the values
+# that shipped before forecast passes were split across models.
+SAME_MODEL_SAMPLING = SpreadScale(
+    regime="same-model sampling variance (o3 x N, temp 0.10-0.20)",
+    gate_armed=True,
+    gate_limit=0.20,
+    heavy_shrink_at=0.20,
+    agreement_full_disagreement_at=0.30,
+    extremize_max=1.60,
+)
+
+# Passes on different models. No distribution of cross-model spread exists yet, so
+# every spread-keyed threshold is disarmed rather than guessed at. #calibration is
+# collecting spread with model_set per row; the gate is re-armed from that data.
+CROSS_MODEL_UNCALIBRATED = SpreadScale(
+    regime="cross-model disagreement (UNCALIBRATED - thresholds disarmed)",
+    gate_armed=False,
+    gate_limit=None,
+    heavy_shrink_at=None,
+    agreement_full_disagreement_at=None,
+    # Spread can no longer suppress over-sharpening, so cap sharpening harder
+    # until it can. Conservative, not a re-tune.
+    extremize_max=1.20,
+    agreement_when_uncalibrated=1.0,
+)
+
 @dataclass
 class BotFeatureFlags:
     enable_extremize: bool = True
@@ -396,23 +450,66 @@ class Dezzy(ForecastBot):
     # the main recurring cost knob in the research stack.
     MAX_SEARCH_QUERIES = 3
 
+    # Smoke-test target. https://www.metaculus.com/tournament/bot-testing-area/
+    TEST_TOURNAMENT_ID = "bot-testing-area"
+
     @staticmethod
     def default_tournament_ids() -> List[str]:
         return ["33022", "market-pulse-26q2"]
 
+    # The forecast passes. _single_model_forecast used to hardcode
+    # "openrouter/openai/o3" for every pass, so three "independent runs" were one
+    # model at temperature 0.10-0.20 and `spread` measured sampling noise. These
+    # are one per vendor family so spread measures genuine disagreement.
+    #
+    # Ranking source: FutureSearch BTF-3, June-July 2026, pooled Brier lower-better
+    # (https://evals.futuresearch.ai/): Claude Opus 5 xhigh 0.118, Opus 4.8 xhigh
+    # 0.130, Fable 5 0.131, GPT-5.5 agent-SDK 0.134, GPT-5.6 Sol 0.135, GPT-5.5
+    # 0.143, Sonnet 5 0.154. o3 does not appear on that board at all.
+    # Metaculus' own FutureEval model leaderboard could not be read (Cloudflare),
+    # so this is justified on BTF-3 alone.
+    # Every slug below was checked against
+    # https://openrouter.ai/api/v1/models/<id>/endpoints and resolves.
+    FORECASTER_MODELS: List[str] = [
+        "openrouter/anthropic/claude-opus-5",          # BTF-3 best single model, 0.116
+        "openrouter/openai/gpt-5.6-sol",               # BTF-3 best available OpenAI, 0.135
+        "openrouter/anthropic/claude-opus-4.8",        # BTF-3 0.130; see note below
+    ]
+    # Probed by --model-check so reachability of alternates is measured rather than
+    # assumed. google/gemini-3.1-pro-preview would give a third vendor family, but
+    # it returned 429 on this account and Google has no non-preview pro slug on
+    # OpenRouter, which is not something to hang a 35-minute cron on. Pass 3 is
+    # therefore a different Anthropic generation: measured on BTF-3 and stable, at
+    # the cost of more correlation with pass 1 than a third family would give.
+    FORECASTER_CANDIDATES: List[str] = [
+        "openrouter/google/gemini-3.1-pro-preview",
+        "openrouter/x-ai/grok-4.5",
+        "openrouter/anthropic/claude-fable-5",
+        "openrouter/openai/gpt-5.5",
+        "openrouter/anthropic/claude-sonnet-5",
+    ]
+
     def _llm_config_defaults(self) -> Dict[str, str]:
         return {
-            "default":         "openrouter/openai/gpt-5.1",
+            "default":         "openrouter/anthropic/claude-opus-5",
             "parser":          "openrouter/openai/gpt-4.1-mini",
-            "query_optimizer": "openrouter/anthropic/claude-sonnet-4-5",
-            "critic":          "openrouter/openai/o3",
-            "red_team":        "openrouter/openai/gpt-5.1",
-            "decomposer":      "openrouter/anthropic/claude-sonnet-4-5",
-            "summarizer":      "openrouter/openai/gpt-4.1",
-            "researcher":      "openrouter/openai/gpt-oss-120b",
-            "online_researcher": "openrouter/openai/gpt-oss-120b",
-            "research_synthesizer": "openrouter/openai/gpt-oss-120b",
+            "query_optimizer": "openrouter/anthropic/claude-sonnet-5",
+            "critic":          "openrouter/openai/gpt-5.6-sol",
+            "red_team":        "openrouter/anthropic/claude-opus-5",
+            "decomposer":      "openrouter/anthropic/claude-sonnet-5",
+            "summarizer":      "openrouter/openai/gpt-4.1-mini",
+            # gpt-oss-120b 404s on this OpenRouter account ("No allowed providers
+            # are available for the selected model"), which is why the recall step
+            # logged "GPT-OSS research failed" on live runs. Verified reachable.
+            "researcher":      "openrouter/openai/gpt-4.1-mini",
+            "online_researcher": "openrouter/openai/gpt-4.1-mini",
+            "research_synthesizer": "openrouter/openai/gpt-4.1-mini",
         }
+
+    @property
+    def spread_scale(self) -> SpreadScale:
+        distinct = len({m for m in self.FORECASTER_MODELS[: self.runs_per_question]})
+        return SAME_MODEL_SAMPLING if distinct <= 1 else CROSS_MODEL_UNCALIBRATED
 
     # ──────────────────────────────────────────────────────────────────────────
     # Research & YFinance
@@ -429,7 +526,7 @@ class Dezzy(ForecastBot):
         "asknews": "[AskNews Results]",
     }
     _MODEL_RECALL_TAGS = {
-        "gptoss": "[GPT-OSS Research]",
+        "synthesis": "[Model Synthesis]",
         "mimo": "[MiMo Research]",
     }
 
@@ -675,9 +772,17 @@ class Dezzy(ForecastBot):
             logger.error(f"MiMo research failed: {e}")
             return "[MiMo research failed]"
 
-    async def _run_gptoss_research(self, question: MetaculusQuestion, research: str) -> str:
+    async def _run_model_synthesis(self, question: MetaculusQuestion, research: str) -> str:
+        """Second pass over the retrieved evidence by the `researcher` role.
+
+        Was _run_gptoss_research with the model hardcoded to gpt-oss-120b, which
+        404s on this account, so it returned "[GPT-OSS research failed]" on every
+        live run. It is now routed through the configured role, and the tag no
+        longer names a model it does not use. It is a synthesis step, not a source:
+        see _WEB_SOURCE_TAGS.
+        """
         try:
-            llm = GeneralLlm(model="openrouter/openai/gpt-oss-120b", temperature=0.1)
+            llm = self.get_llm("researcher", "llm")
             prompt = clean_indents(f"""
                 You are a research assistant. Research this forecasting question using the Tavily results and your knowledge and provide:
                 1. Key factual findings.
@@ -687,10 +792,10 @@ class Dezzy(ForecastBot):
                 Existing research: {research[:2000] if research else 'None'}
             """)
             response = await llm.invoke(prompt)
-            return f"[GPT-OSS Research]\n{response.strip()}"
+            return f"[Model Synthesis]\n{response.strip()}"
         except Exception as e:
-            logger.error(f"GPT-OSS research failed: {e}")
-            return "[GPT-OSS research failed]"
+            logger.error(f"Model synthesis failed: {type(e).__name__}: {e}")
+            return "[Model synthesis failed]"
 
     async def _summarize_research(self, question: MetaculusQuestion, raw_research: str) -> str:
         llm = self.get_llm("summarizer", "llm")
@@ -747,7 +852,7 @@ class Dezzy(ForecastBot):
         # Model-recall pass runs last so it can actually see the retrieved evidence.
         # It used to be handed "" while its own prompt referred to Tavily results.
         # It does not count toward the web-source total; see _search_footprint.
-        recall = await self._run_gptoss_research(question, web_text)
+        recall = await self._run_model_synthesis(question, web_text)
         cleaned = web_cleaned + [recall]
         
         research = (
@@ -769,7 +874,6 @@ class Dezzy(ForecastBot):
     #   binary / multiple-choice -> absolute probability spread across runs, bounded 0..1
     #   numeric                  -> relative interval width (p90-p10)/|median|, unbounded
     # so only the probability paths may be compared against SPREAD_LIMIT_PROB.
-    SPREAD_LIMIT_PROB = 0.20
     MAX_LOW_CONFIDENCE_SHRINK = 0.30
 
     def _spring_ai_confidence_shrink(
@@ -804,12 +908,20 @@ class Dezzy(ForecastBot):
 
         trace.add("Spring AI Confidence Gate", f"Evaluating... spread={spread:.4f}, quality={quality:.2f}")
 
+        scale = self.spread_scale
         alpha = 0.0
         reasons: List[str] = []
-        if spread > self.SPREAD_LIMIT_PROB:
-            over = (spread - self.SPREAD_LIMIT_PROB) / self.SPREAD_LIMIT_PROB
+        if not scale.gate_armed:
+            trace.add(
+                "Spring AI Confidence Gate",
+                f"spread={spread:.4f} recorded but NOT gated: regime is \"{scale.regime}\". "
+                f"The 0.20 limit was calibrated against same-model sampling variance and does not "
+                f"transfer to cross-model disagreement. Re-arm from a measured distribution.",
+            )
+        elif scale.gate_limit is not None and spread > scale.gate_limit:
+            over = (spread - scale.gate_limit) / scale.gate_limit
             alpha += 0.15 * over
-            reasons.append(f"spread {spread:.2f} > {self.SPREAD_LIMIT_PROB:.2f}")
+            reasons.append(f"spread {spread:.2f} > {scale.gate_limit:.2f}")
         if quality < 0.65:
             alpha += 0.15
             reasons.append(f"research quality {quality:.2f} < 0.65")
@@ -844,9 +956,22 @@ class Dezzy(ForecastBot):
         return 0.20 if days_to_close > 180 else 0.10
 
     def _agreement_strength(self, probs: List[float]) -> float:
+        """Agreement in [0,1], used to scale extremize strength.
+
+        The old form was `1.0 - spread/0.30`, with 0.30 calibrated against
+        same-model sampling variance. Under cross-model spread it returns 0 on
+        almost every question, which drives _extremize_strength to exactly 1.0 and
+        turns extremize off across the board with no log line saying so. When the
+        scale is uncalibrated this returns neutral agreement instead, and the
+        sharpening ceiling is lowered via SpreadScale.extremize_max to compensate.
+        """
         if not probs: return 0.0
+        scale = self.spread_scale
+        denom = scale.agreement_full_disagreement_at
+        if denom is None:
+            return float(np.clip(scale.agreement_when_uncalibrated, 0.0, 1.0))
         spread = max(probs) - min(probs) if len(probs) > 1 else 0.0
-        return float(np.clip(1.0 - (spread / 0.30), 0.0, 1.0))
+        return float(np.clip(1.0 - (spread / denom), 0.0, 1.0))
 
     def _extremize_strength(self, research: str, probs: List[float], question: MetaculusQuestion) -> float:
         if not self.flags.enable_extremize: return 1.0
@@ -857,7 +982,7 @@ class Dezzy(ForecastBot):
         if close_time:
             days = (close_time - datetime.now(timezone.utc)).days
             if days < 60: base = 1.0 + (base - 1.0) * 0.6
-        return float(np.clip(base, 0.95, 1.6))
+        return float(np.clip(base, 0.95, self.spread_scale.extremize_max))
 
     @staticmethod
     def _extremize_gate(p: float) -> bool:
@@ -1051,7 +1176,11 @@ class Dezzy(ForecastBot):
 
     async def _single_model_forecast(self, question: MetaculusQuestion, research: str, run_index: int, trace: ReasoningTrace, grounded_context: Optional[str] = None) -> Any:
         self._note_research_footprint(research)
-        model = "openrouter/openai/o3"
+        model = self.FORECASTER_MODELS[(max(1, run_index) - 1) % len(self.FORECASTER_MODELS)]
+        # Logged, not traced: add_narrative deliberately anonymises model identity in
+        # the published rationale, and that intent is preserved here. #calibration
+        # records model_set on its own rows.
+        logger.info(f"[{self.bot_name}] forecast pass {run_index} model={model}")
         llm = GeneralLlm(model=model, temperature=self._get_temperature(question))
         context = grounded_context or self._build_grounded_context(question, research, "Premortem unavailable.")
 
@@ -1164,7 +1293,13 @@ class Dezzy(ForecastBot):
         trace.add(f"Multi-run aggregation ({len(probs)} runs)", f"individual={[f'{p:.4f}' for p in probs]} | median={run_med:.4f} | spread={spread:.4f}")
         applied: List[str] = []
 
-        shrink = 0.28 if spread >= 0.20 else (0.22 if quality < 0.70 else 0.12)
+        scale = self.spread_scale
+        if scale.heavy_shrink_at is not None and spread >= scale.heavy_shrink_at:
+            shrink = 0.28
+        else:
+            # Uncalibrated regime: spread cannot select a shrink rung, so fall back to
+            # the research-quality ladder, which is calibrated independently of spread.
+            shrink = 0.22 if quality < 0.70 else 0.12
         shrink = float(np.clip(shrink + low_conf_shrink, 0.0, 0.60))
         if no_evidence:
             shrink = max(shrink, self.NO_EVIDENCE_SHRINK)
@@ -1193,11 +1328,28 @@ class Dezzy(ForecastBot):
                 ext_strength = self._extremize_strength(research, probs + [combined], question)
                 p_ext = ForecastingPrinciples.extremize_logit(combined, ext_strength)
                 applied.append(f"extremize(x{ext_strength:.2f})")
+                # A strength of 1.0 makes extremize_logit an identity function. That
+                # used to happen silently whenever _agreement_strength returned 0,
+                # so the config claimed extremize was on while it did nothing.
+                if abs(ext_strength - 1.0) < 1e-3:
+                    trace.add(
+                        "Extremize",
+                        f"resolved to strength {ext_strength:.4f} - identity, no sharpening applied "
+                        f"(agreement={self._agreement_strength(probs):.3f}, "
+                        f"quality={self._research_quality_weight(research):.2f}, "
+                        f"regime=\"{self.spread_scale.regime}\")",
+                    )
+                    logger.warning(
+                        f"[{self.bot_name}] extremize resolved to identity (strength={ext_strength:.4f}) "
+                        f"under regime: {self.spread_scale.regime}"
+                    )
             else:
                 p_ext = combined
                 applied.append("extremize(gated-off)")
+                trace.add("Extremize", f"SKIPPED - p={combined:.4f} outside the (0.02, 0.98) gate or exactly 0.5.")
         else:
             p_ext = combined
+            trace.add("Extremize", "SKIPPED - disabled by --no-extremize.")
 
         p_time = ForecastingPrinciples.apply_time_decay(p_ext, getattr(question, "close_time", None))
         if abs(p_time - p_ext) > 1e-6: applied.append("time-decay")
@@ -1396,6 +1548,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-numeric-regimes", action="store_true")
     parser.add_argument("--no-red-team", action="store_true")
     parser.add_argument("--no-consistency", action="store_true")
+    parser.add_argument("--model-check", action="store_true",
+                        help="Send a one-token prompt to every configured model and exit nonzero if any is unreachable. No Metaculus calls.")
     parser.add_argument("--research-check", action="store_true",
                         help="Execute the web search clients only, print what each returned, and exit nonzero if a configured client returns no evidence. No Metaculus or LLM calls.")
     parser.add_argument("--research-check-query", type=str,
@@ -1403,6 +1557,49 @@ if __name__ == "__main__":
                         help="Query used by --research-check.")
 
     args = parser.parse_args()
+
+    if args.model_check:
+        # Sends a minimal prompt to every model this bot is configured to use, so a
+        # bad or retired slug surfaces here rather than as a silently swallowed
+        # exception inside a try/except during a live run.
+        probe = Dezzy.__new__(Dezzy)
+        Dezzy.__init__(
+            probe,
+            research_reports_per_question=1, predictions_per_research_report=1,
+            publish_reports_to_metaculus=False, bot_name="model-check",
+        )
+        targets: List[Tuple[str, str]] = [
+            (f"forecaster_{i + 1}", m) for i, m in enumerate(probe.FORECASTER_MODELS)
+        ] + sorted(probe._llm_config_defaults().items()) + [
+            (f"candidate", m) for m in probe.FORECASTER_CANDIDATES
+        ]
+
+        async def _ping() -> int:
+            failures: List[str] = []
+            seen: Dict[str, str] = {}
+            print("\n=== model check ===\n")
+            for role, model in targets:
+                if model in seen:
+                    print(f"  {role:22} {model:46} reuses {seen[model]}")
+                    continue
+                try:
+                    out = await GeneralLlm(model=model, temperature=0.0).invoke(
+                        "Reply with the single word: OK"
+                    )
+                    text = (out or "").strip().replace("\n", " ")[:60]
+                    print(f"  {role:22} {model:46} OK    <- {text!r}")
+                    seen[model] = role
+                except Exception as e:
+                    print(f"  {role:22} {model:46} FAIL  {type(e).__name__}: {str(e)[:180]}")
+                    if role != "candidate":
+                        failures.append(f"{role}={model}")
+            if failures:
+                print(f"\nGATE FAIL: {len(failures)} model(s) unreachable: {failures}")
+                return 1
+            print(f"\nGATE PASS: {len(seen)} distinct model(s) reachable.")
+            return 0
+
+        raise SystemExit(asyncio.run(_ping()))
 
     if args.research_check:
         # Executes the three web search clients directly against whatever creds are
@@ -1483,10 +1680,20 @@ if __name__ == "__main__":
     if not os.getenv("TAVILY_API_KEY") and not os.getenv("EXA_API_KEY"):
         raise RuntimeError("Set at least one of TAVILY_API_KEY or EXA_API_KEY in your environment.")
 
+    # Test runs must not publish. Previously test_questions shared the tournament
+    # config and would have posted forecasts to whatever it was pointed at.
+    publish = args.mode != "test_questions"
     bot = Dezzy(
         research_reports_per_question=1, predictions_per_research_report=1,
-        publish_reports_to_metaculus=True, skip_previously_forecasted_questions=False,
+        publish_reports_to_metaculus=publish, skip_previously_forecasted_questions=False,
         bot_name=args.bot_name, flags=flags, runs_per_question=max(1, int(args.runs)),
+    )
+    logger.info(
+        f"[{args.bot_name}] mode={args.mode} publish={publish} runs={bot.runs_per_question} "
+        f"spread_regime=\"{bot.spread_scale.regime}\" gate_armed={bot.spread_scale.gate_armed}"
+    )
+    logger.info(
+        f"[{args.bot_name}] forecast models: {bot.FORECASTER_MODELS[: bot.runs_per_question]}"
     )
 
     client = MetaculusClient()
@@ -1504,9 +1711,15 @@ if __name__ == "__main__":
             bot.set_active_tournament(str(client.CURRENT_METACULUS_CUP_ID))
             return await bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
 
+        # test_questions. PR #1 ("minibench removed") rewrote
+        # default_tournament_ids() but left this fallback hardcoded to
+        # market-pulse-26q2, which closed at the end of June 2026 and returns 0
+        # questions. That is why "Test Bot" has been a silent no-op ever since.
+        # bot-testing-area is the target the official template uses for smoke
+        # tests and contains every question type.
         bot.skip_previously_forecasted_questions = False
-        bot.set_active_tournament("market-pulse-26q2")
-        return await bot.forecast_on_tournament("market-pulse-26q2", return_exceptions=True)
+        bot.set_active_tournament(Dezzy.TEST_TOURNAMENT_ID)
+        return await bot.forecast_on_tournament(Dezzy.TEST_TOURNAMENT_ID, return_exceptions=True)
 
     reports = asyncio.run(run_all())
     # Emitted before log_report_summary because that call re-raises on any captured
